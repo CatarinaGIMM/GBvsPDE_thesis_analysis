@@ -1,0 +1,1537 @@
+---
+title: "GB tissue vs PDE: scRNA-seq analysis for thesis figures"
+author: "Catarina de Oliveira"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+<!--
+Organization on the script : 
+Two kinds of chunks:
+  - chunks tagged FIGURE: BODY produce a figure meant for the thesis body.
+  - chunks tagged FIGURE: ANNEX produce a figure meant for the appendix
+-->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 6, fig.height = 4.5  # default (single-panel) size; overridden per chunk below
+)
+```
+
+## 0. Packages, shared theme, figure-size classes
+
+```{r libraries}
+library(Seurat)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+library(scales)
+library(openxlsx)
+library(infercnv)
+library(future)
+```
+
+```{r theme-thesis}
+# ----------------------------------------------------------------------------
+#Shared theme for every figures
+# ----------------------------------------------------------------------------
+theme_thesis <- function(base_size = 12) {
+  theme_minimal(base_size = base_size) %+replace%
+    theme(
+      panel.grid       = element_blank(),
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.background  = element_rect(fill = "white", color = NA),
+      axis.line        = element_line(color = "black", linewidth = 0.4),
+      axis.ticks       = element_line(color = "black", linewidth = 0.4),
+      plot.title      = element_text(size = base_size + 2, face = "bold", hjust = 0),
+      plot.subtitle   = element_text(size = base_size,     color = "grey30"),
+      axis.title      = element_text(size = base_size),
+      axis.text       = element_text(size = base_size - 1),
+      legend.title    = element_text(size = base_size, face = "bold"),
+      legend.text     = element_text(size = base_size - 1),
+      strip.text      = element_text(size = base_size, face = "bold")
+    )
+}
+
+# Standard figure-size CLASSES (inches, at 300 dpi for ggsave). 
+FIG_SINGLE  <- list(w = 5.5, h = 4.5)    # one panel (e.g. one UMAP, one bar chart)
+FIG_DOUBLE  <- list(w = 9,   h = 4.5)    # two panels side by side
+FIG_GRID2x2 <- list(w = 10,  h = 8)      # 2x2 grid (e.g. 4 resolutions/PC choices)
+FIG_WIDE    <- list(w = 13,  h = 5)      # wide multi-panel row (e.g. 4-8 FeaturePlots)
+
+save_thesis <- function(plot, filename, size = FIG_SINGLE, dpi = 300) {
+  ggsave(filename, plot, width = size$w, height = size$h, dpi = dpi)
+}
+```
+
+## 1. Data import and Seurat object creation
+
+```{r data-import}
+# Path to 10x data
+## Base directory
+## Subfolders : Cell Ranger folders, Souporcell folders
+data_dir       <- "Data"
+cellranger_dir <- file.path(data_dir, "cellranger_outputs")
+souporcell_dir <- file.path(data_dir, "souporcell_outputs")
+
+gb_dir  <- file.path(cellranger_dir, "gbtx1_sample_filtered_feature_bc_matrix")  # tissue
+pde_dir <- file.path(cellranger_dir, "gbtx2_sample_filtered_feature_bc_matrix")  # PDE
+
+gb_soup_file  <- file.path(souporcell_dir, "gbtx1_clusters.tsv")
+pde_soup_file <- file.path(souporcell_dir, "gbtx2_clusters.tsv")
+
+### Load the matrix Cell Ranger
+gb_counts  <- Read10X(data.dir = gb_dir)
+pde_counts <- Read10X(data.dir = pde_dir)
+### Check les dimensions --> genes number, cells number
+dim(gb_counts)
+dim(pde_counts)
+
+### Load the SouporCell
+soup_gb  <- read.delim(gb_soup_file)
+soup_pde <- read.delim(pde_soup_file)
+
+# Create Seurat objects
+# lignes = gènes, colonnes = cellules, valeurs = counts (nombre de reads / UMI)
+# Seurat calcule for each cell : nFeature_RNA (genes), nCount_RNA (total de counts)
+gb  <- CreateSeuratObject(
+  counts = gb_counts,
+  project = "GB_tissue",     # project's name
+  min.cells = 3,             # un gène doit être exprimé dans min 3 cells
+  min.features = 200         # cell doit avoir au moins 200 gènes détectés
+)
+pde <- CreateSeuratObject(
+  counts = pde_counts,
+  project = "PDE",
+  min.cells = 3,
+  min.features = 200
+)
+
+# Add metadata, new columns in the Seurat matrix
+# Metadata = informations sur les cellules, "une étiquette", exemple : condition, patient, clusters
+# Add Condition metadata
+gb$condition  <- "Tissue"
+pde$condition <- "PDE"
+
+# Add Souporcell metadata
+## Match barcodes between Seurat and Souporcell outputs (identify the same cells in both datasets)
+## assignment : attribute each cell to a genetic cluster (future patient identity, revealed with génotype)
+## status : indicates whether the assignment is reliable
+###singlet = one cell detected
+###doublet = two cells captured together (will be removed)
+gb$souporcell_cluster <- soup_gb$assignment[match(colnames(gb), soup_gb$barcode)]
+gb$souporcell_status  <- soup_gb$status[match(colnames(gb), soup_gb$barcode)]
+pde$souporcell_cluster <- soup_pde$assignment[match(colnames(pde), soup_pde$barcode)]
+pde$souporcell_status  <- soup_pde$status[match(colnames(pde), soup_pde$barcode)]
+
+head(gb@meta.data)  # to look at the metadata of my seurat object, to check if it works
+table(gb$souporcell_status, useNA = "ifany")   # to check singlet/doublets
+table(gb$souporcell_cluster, useNA = "ifany")  # to check cells per patients
+table(pde$souporcell_status, useNA = "ifany")
+table(pde$souporcell_cluster, useNA = "ifany")
+# useNA = "ifany" is to see if something gets wrong or not assigned, it will be written NA
+# Option          Signification :
+## "no"     ne jamais montrer les NA
+## "ifany"  montrer seulement s'il y en a
+## "always" toujours afficher NA
+```
+
+## 2. QC
+
+```{r qc-singlets}
+# Keep only the status = singlets (for the Souporcell metadata)
+# (les sankey plots de la répartition singlet/doublet ont été faits avec sankeymatic.com)
+gb_singlet  <- subset(gb,  subset = souporcell_status == "singlet")
+pde_singlet <- subset(pde, subset = souporcell_status == "singlet")
+
+# QC = removing unwanted cells from the dataset
+# To add a column named percent.mt and calculer % de gènes mitochondriaux par cellule
+# PercentageFeatureSet = counts mitochondriaux / counts totaux cellule x 100
+gb_singlet  <- PercentageFeatureSet(gb_singlet,  col.name = "percent.mt", assay = "RNA", pattern = "^MT-")
+pde_singlet <- PercentageFeatureSet(pde_singlet, col.name = "percent.mt", assay = "RNA", pattern = "^MT-")
+```
+
+```{r qc-before-violin, fig.width=9, fig.height=4.5}
+# FIGURE: ANNEX -- QC metrics before filtering
+# Plot QC metrics as a violin plot
+v_gb_before <- VlnPlot(gb_singlet, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+                       ncol = 3,            # number of columns
+                       log = TRUE,          # Y en échelle logarithmique, change juste l'affichage
+                       assay = "RNA",
+                       layer = "counts",    # to have the raw data (différents layers dans un assay)
+                       pt.size = 0.1) &     # taille des dots, pour pas que ce soit trop gros
+  theme_thesis() & NoLegend() & plot_annotation(title = "GB tissue: before QC filtration")
+v_gb_before
+save_thesis(v_gb_before, "qc_before_violin_tissue.png", FIG_DOUBLE)
+
+v_pde_before <- VlnPlot(pde_singlet, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+                        ncol = 3, log = TRUE, assay = "RNA", layer = "counts", pt.size = 0.1) &
+  theme_thesis() & NoLegend() & plot_annotation(title = "PDE: before QC filtration")
+v_pde_before
+save_thesis(v_pde_before, "qc_before_violin_pde.png", FIG_DOUBLE)
+```
+
+```{r qc-before-scatter, fig.width=9, fig.height=8}
+# FIGURE: ANNEX -- nCount vs percent.mt and nCount vs nFeature, before filtering
+## Scatter plot
+# FeatureScatter is typically used to visualize feature-feature relationships
+p1 <- FeatureScatter(gb_singlet, feature1 = "nCount_RNA", feature2 = "percent.mt") +
+  coord_cartesian(xlim = c(0, 1e5), ylim = c(0, 100)) + theme_thesis()
+p2 <- FeatureScatter(gb_singlet, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +
+  coord_cartesian(xlim = c(0, 1e5), ylim = c(0, 1e4)) + theme_thesis()
+p3 <- FeatureScatter(pde_singlet, feature1 = "nCount_RNA", feature2 = "percent.mt") +
+  coord_cartesian(xlim = c(0, 1e5), ylim = c(0, 100)) + theme_thesis()
+p4 <- FeatureScatter(pde_singlet, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +
+  coord_cartesian(xlim = c(0, 1e5), ylim = c(0, 1e4)) + theme_thesis()
+
+scatter_before <- (p1 | p2) / (p3 | p4) + plot_annotation(title = "Before QC filtration (top: tissue, bottom: PDE)")
+scatter_before
+save_thesis(scatter_before, "qc_before_scatter.png", FIG_GRID2x2)
+```
+
+```{r qc-apply}
+# Apply QC ; seuils adaptés du papier de Jacob et al.
+qcthr <- c(
+  maxMT = 15,     # mitochondrial reads
+  minG  = 800,    # min genes par cellule (nFeature_RNA)
+  maxG  = 10000   # max genes par cellule (nFeature_RNA)
+)
+
+cells_gb  <- gb_singlet$percent.mt  < qcthr["maxMT"] & gb_singlet$nFeature_RNA  > qcthr["minG"] & gb_singlet$nFeature_RNA  < qcthr["maxG"]
+cells_pde <- pde_singlet$percent.mt < qcthr["maxMT"] & pde_singlet$nFeature_RNA > qcthr["minG"] & pde_singlet$nFeature_RNA < qcthr["maxG"]
+
+gb_qc  <- subset(gb_singlet,  cells = colnames(gb_singlet)[cells_gb])
+pde_qc <- subset(pde_singlet, cells = colnames(pde_singlet)[cells_pde])
+
+# look at how many cells we remove (cells kept: tissue = ncol(gb_qc)/ncol(gb_singlet), PDE = ncol(pde_qc)/ncol(pde_singlet))
+c(tissue_before = ncol(gb_singlet), tissue_after = ncol(gb_qc),
+  pde_before = ncol(pde_singlet), pde_after = ncol(pde_qc))
+```
+
+```{r qc-after-violin, fig.width=9, fig.height=4.5}
+# FIGURE: ANNEX -- QC metrics after filtering
+# look again at the plots after the QC
+v_gb_after <- VlnPlot(gb_qc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+                      ncol = 3, log = TRUE, assay = "RNA", layer = "counts") &
+  theme_thesis() & NoLegend() & plot_annotation(title = "GB tissue: after QC filtration")
+v_gb_after
+save_thesis(v_gb_after, "qc_after_violin_tissue.png", FIG_DOUBLE)
+
+v_pde_after <- VlnPlot(pde_qc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+                       ncol = 3, log = TRUE, assay = "RNA", layer = "counts") &
+  theme_thesis() & NoLegend() & plot_annotation(title = "PDE: after QC filtration")
+v_pde_after
+save_thesis(v_pde_after, "qc_after_violin_pde.png", FIG_DOUBLE)
+```
+
+## 3. Full-cohort integration (all 4 genetic clusters per pool)
+
+This step exists only to obtain a broad cell-type annotation
+(`manual_annotation_broad`) used later as the *reference* (non-malignant)
+cells for inferCNV -- myeloid, endothelial and stromal/perivascular cells,
+identifiable regardless of which patient they came from. It is not itself a
+thesis figure.
+
+```{r integration-sctransform}
+set.seed(1)
+# INTEGRATION step 1) Prepare object for Seurat v5 integration
+# Merge Tissue and PDE in a new object for integration
+gb_pde_integrated <- merge(gb_qc, y = pde_qc, add.cell.ids = c("Tissue", "PDE"),
+                           project = "GB_Tissue_PDE_integrated")
+# Check that both conditions are present
+table(gb_pde_integrated$condition)
+
+# INTEGRATION step 3) SCTransform before integration
+# Use SCTransform : parce que ça gère mieux les différences techniques, stabilise la variance,
+# fonctionne très bien pour des datasets hétérogènes, et est très utilisé maintenant
+gb_pde_integrated <- SCTransform(gb_pde_integrated, assay = "RNA", vars.to.regress = "percent.mt",
+                                  variable.features.n = 3000, verbose = FALSE, seed.use = 1)
+
+# "Pour les prochaines étapes, utilise les données normalisées SCT, pas les données RNA brutes."
+DefaultAssay(gb_pde_integrated) <- "SCT"
+
+# INTEGRATION step 4 - PCA before integration
+# PCA = Principal Component Analysis -- choose number of PCA
+gb_pde_integrated <- RunPCA(gb_pde_integrated, verbose = FALSE)
+
+# problème d'espace... qui bloque quand les exports sont trop gros, donc on change cette limite
+# Increase memory limit for future
+options(future.globals.maxSize = 4 * 1024^3)
+# Optional: run sequentially to avoid parallel export issues
+plan("sequential")
+```
+
+```{r integration-rpca}
+# INTEGRATION step 5 - Integrate Tissue and PDE using RPCA
+## Anchor-based RPCA integration : représente une méthode plus rapide et plus conservative
+## (moins de correction) pour l'intégration.
+gb_pde_integrated <- IntegrateLayers(
+  object = gb_pde_integrated, method = RPCAIntegration, normalization.method = "SCT",
+  orig.reduction = "pca", new.reduction = "integrated.rpca", dims = 1:12, verbose = FALSE
+)
+
+gb_pde_integrated <- RunUMAP(gb_pde_integrated, reduction = "integrated.rpca", dims = 1:12,
+                              reduction.name = "umap.integrated")
+gb_pde_integrated <- FindNeighbors(gb_pde_integrated, reduction = "integrated.rpca", dims = 1:12)
+gb_pde_integrated <- FindClusters(gb_pde_integrated, resolution = 0.5, verbose = FALSE)
+
+gb_pde_integrated$integrated_clusters <- gb_pde_integrated$SCT_snn_res.0.5
+Idents(gb_pde_integrated) <- "integrated_clusters"
+```
+
+```{r integration-annotate-broad}
+# Broad annotation, used ONLY to flag non-malignant reference cells for
+# inferCNV below. Cluster identities were determined by inspecting canonical
+# markers per cluster (cycling/tumor-neural/immune/endothelial/oligo/
+# astro/progenitor marker panels -- not reproduced here, see methods).
+cluster_annotations_broad <- c(
+  "0" = "OPC-like cells", "1" = "Astrocyte-like cells", "2" = "Cycling cells",
+  "3" = "Inflammatory myeloid cells", "4" = "Oligodendrocyte-like cells",
+  "5" = "Cycling cells", "6" = "Cycling cells", "7" = "Stromal / Perivascular cells",
+  "8" = "Neuronal-like cells", "9" = "Endothelial cells"
+)
+
+gb_pde_integrated$manual_annotation_broad <- unname(
+  cluster_annotations_broad[as.character(gb_pde_integrated$integrated_clusters)]
+)
+
+gb_obj  <- subset(gb_pde_integrated, subset = condition == "Tissue")
+pde_obj <- subset(gb_pde_integrated, subset = condition == "PDE")
+
+table(gb_obj$souporcell_cluster, gb_obj$manual_annotation_broad)
+table(pde_obj$souporcell_cluster, pde_obj$manual_annotation_broad)
+```
+
+## 4. inferCNV -- gene position file (one-time step)
+
+```{r gene-order-file, eval=FALSE}
+# Run once; reused for every inferCNV call below. Requires the GENCODE v50
+# GTF (GRCh38/hg38) downloaded from https://www.gencodegenes.org/human/.
+if (!requireNamespace("data.table", quietly = TRUE)) install.packages("data.table")
+library(data.table)
+
+gtf_file <- "gencode.v50.annotation.gtf"
+gene_order_output_file <- "gencode_v50_gene_pos.txt"
+
+gtf <- fread(gtf_file, header = FALSE, sep = "\t", quote = "", skip = "chr",
+             col.names = c("chr", "source", "feature", "start", "end", "score", "strand", "frame", "attributes"))
+
+genes <- gtf[feature == "gene"]
+genes[, gene_name := sub('.*gene_name "([^"]+)".*', "\\1", attributes)]
+gene_order <- genes[, .(gene_name, chr, start, end)]
+gene_order <- gene_order[!duplicated(gene_name)]
+
+main_chromosomes <- c(paste0("chr", 1:22), "chrX", "chrY", "chrM")
+gene_order[, chr := factor(chr, levels = main_chromosomes)]
+gene_order <- gene_order[!is.na(chr)]
+gene_order <- gene_order[order(chr, start)]
+gene_order[, chr := as.character(chr)]
+
+fwrite(gene_order, gene_order_output_file, sep = "\t", col.names = FALSE)
+```
+
+```{r gene-order-load}
+gene_order_file <- "gencode_v50_gene_pos.txt"
+gene_order <- read.delim(gene_order_file, header = FALSE, col.names = c("gene", "chr", "start", "end"))
+rownames(gene_order) <- gene_order$gene
+```
+
+## 5. Shared, gene-verified myeloid reference for inferCNV
+
+A first inferCNV pass (endothelial + stromal + myeloid reference cells,
+taken from the broad cluster-level annotation above) confirmed the HGG vs
+LGG split, but PDE had too few of its own reference cells for a clean
+per-pool comparison. To fix that, reference cells are instead selected
+directly by canonical myeloid marker expression, pooled across BOTH tissue
+and PDE, and sanity-checked against a mesenchymal-like signature to exclude
+any malignant contamination.
+
+```{r myeloid-reference}
+myeloid_markers  <- c("AIF1", "CD163", "LYZ", "C1QA", "C1QB", "TYROBP", "FCGR3A")
+mes_like_markers <- c("VEGFA", "HILPDA", "CA9", "ADM", "COL1A2", "COL4A1", "BGN")
+
+# Score on normalized RNA counts, not the current default assay (SCT, left
+# over from Section 3). SCT stores variance-stabilized Pearson residuals
+gb_obj  <- NormalizeData(gb_obj,  assay = "RNA", verbose = FALSE)
+pde_obj <- NormalizeData(pde_obj, assay = "RNA", verbose = FALSE)
+
+gb_obj  <- AddModuleScore(gb_obj,  features = list(myeloid_markers), name = "myeloid_score",    assay = "RNA")
+pde_obj <- AddModuleScore(pde_obj, features = list(myeloid_markers), name = "myeloid_score",    assay = "RNA")
+gb_obj  <- AddModuleScore(gb_obj,  features = list(mes_like_markers), name = "mes_check_score", assay = "RNA")
+pde_obj <- AddModuleScore(pde_obj, features = list(mes_like_markers), name = "mes_check_score", assay = "RNA")
+
+# Candidate reference cells: myeloid_score1 > 0.5, then drop any with a
+# positive MES-like score (likely malignant contamination).
+gb_myeloid_ref_cells_clean  <- colnames(gb_obj)[gb_obj$myeloid_score1 > 0.5 & gb_obj$mes_check_score1 <= 0]
+pde_myeloid_ref_cells_clean <- colnames(pde_obj)[pde_obj$myeloid_score1 > 0.5]
+
+shared_myeloid_reference_clean <- c(gb_myeloid_ref_cells_clean, pde_myeloid_ref_cells_clean)
+length(shared_myeloid_reference_clean)  # total reference cells (tissue + PDE)
+length(gb_myeloid_ref_cells_clean)      # tissue-side count
+length(pde_myeloid_ref_cells_clean)     # PDE-side count
+
+```
+
+```{r combined-object-for-reference}
+DefaultAssay(gb_obj)  <- "RNA"
+DefaultAssay(pde_obj) <- "RNA"
+
+gb_diet  <- DietSeurat(gb_obj,  assays = "RNA", layers = "counts")
+pde_diet <- DietSeurat(pde_obj, assays = "RNA", layers = "counts")
+
+combined_for_ref <- merge(gb_diet, y = pde_diet, project = "combined_for_shared_reference")
+combined_for_ref <- JoinLayers(combined_for_ref)
+stopifnot(sum(duplicated(colnames(combined_for_ref))) == 0)
+```
+
+## 6. inferCNV per genetic cluster (shared myeloid reference)
+
+```{r infercnv-runner}
+run_infercnv_shared_reference <- function(seurat_obj, combined_obj, pool_label,
+                                           cluster_col = "souporcell_cluster",
+                                           fixed_ref_cells, gene_order_file,
+                                           out_dir_base = "infercnv_by_genetic_cluster_v2",
+                                           min_ref_cells = 30, n_threads = 4, clusters_subset = NULL) {
+
+  dir.create(out_dir_base, showWarnings = FALSE, recursive = TRUE)
+  meta <- seurat_obj@meta.data
+  stopifnot(cluster_col %in% colnames(meta))
+
+  clusters <- sort(unique(na.omit(meta[[cluster_col]])))
+  if (!is.null(clusters_subset)) clusters <- clusters[clusters %in% clusters_subset]
+
+  ref_cells <- fixed_ref_cells
+  if (length(ref_cells) < min_ref_cells) stop("Shared reference has fewer than min_ref_cells -- check filtering.")
+
+  results <- list()
+  for (cl in clusters) {
+    cells_this_cluster <- rownames(meta)[meta[[cluster_col]] == cl]
+    n_cells <- length(cells_this_cluster)
+    message(sprintf("[%s] cluster %s: %d cells", pool_label, cl, n_cells))
+    if (n_cells < 50) warning(sprintf("[%s] cluster %s: only %d cells (<50)", pool_label, cl, n_cells))
+
+    test_cells <- setdiff(cells_this_cluster, ref_cells)
+    obj_sub <- subset(combined_obj, cells = c(test_cells, ref_cells))
+    obj_sub <- tryCatch(JoinLayers(obj_sub), error = function(e) obj_sub)
+    counts  <- GetAssayData(obj_sub, assay = "RNA", layer = "counts")
+
+    annot <- data.frame(
+      group = ifelse(colnames(obj_sub) %in% ref_cells, "reference", paste0(pool_label, "_cluster", cl)),
+      row.names = colnames(obj_sub)
+    )
+    annot_file <- file.path(out_dir_base, sprintf("annot_%s_cluster%s.txt", pool_label, cl))
+    write.table(annot, annot_file, sep = "\t", col.names = FALSE, quote = FALSE)
+
+    out_dir <- file.path(out_dir_base, sprintf("%s_cluster%s", pool_label, cl))
+    dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+    infercnv_obj <- CreateInfercnvObject(raw_counts_matrix = counts, annotations_file = annot_file,
+                                          gene_order_file = gene_order_file, ref_group_names = "reference")
+    infercnv_obj <- infercnv::run(infercnv_obj, cutoff = 0.1, out_dir = out_dir, cluster_by_groups = TRUE,
+                                   denoise = TRUE, HMM = FALSE, num_threads = n_threads)
+
+    results[[as.character(cl)]] <- list(n_cells = n_cells, out_dir = out_dir, status = "done")
+    rm(obj_sub, counts, infercnv_obj, annot)
+    gc(verbose = FALSE)
+  }
+  results
+}
+
+# Reads one cluster's inferCNV result and returns a chr7-vs-chr10 score
+# (per cell and averaged) plus the per-gene mean profile ("fingerprint").
+read_infercnv_chr_profile <- function(out_dir) {
+  obj_file <- file.path(out_dir, "run.final.infercnv_obj")
+  if (!file.exists(obj_file)) { warning(sprintf("Can't find %s", obj_file)); return(NULL) }
+  infercnv_obj <- readRDS(obj_file)
+
+  full_mat <- infercnv_obj@expr.data
+  obs_idx  <- unlist(infercnv_obj@observation_grouped_cell_indices)
+  obs      <- full_mat[, obs_idx, drop = FALSE]
+
+  common_genes <- intersect(rownames(obs), rownames(gene_order))
+  obs   <- obs[common_genes, , drop = FALSE]
+  chrom <- gene_order[common_genes, "chr"]
+  chr7_genes  <- common_genes[chrom %in% c("chr7", "7")]
+  chr10_genes <- common_genes[chrom %in% c("chr10", "10")]
+
+  score_per_cell <- colMeans(obs[chr7_genes, , drop = FALSE]) - colMeans(obs[chr10_genes, , drop = FALSE])
+
+  list(mean_gene_profile = rowMeans(obs), score_chr7_minus_chr10 = mean(score_per_cell),
+       score_chr7_minus_chr10_per_cell = score_per_cell, n_cells = ncol(obs))
+}
+
+collect_chr_profiles <- function(res) {
+  profiles <- list()
+  for (cl in names(res)) {
+    if (!identical(res[[cl]]$status, "done")) next
+    profiles[[cl]] <- read_infercnv_chr_profile(res[[cl]]$out_dir)
+  }
+  profiles
+}
+```
+
+```{r infercnv-run, eval=FALSE}
+# Runs all 4 genetic clusters per pool (not just the HGG candidates) so the
+# HGG/LGG split itself is re-confirmed under the cleaner shared reference.
+
+res_gb_v2 <- run_infercnv_shared_reference(
+  seurat_obj = gb_diet, combined_obj = combined_for_ref, pool_label = "GB",
+  fixed_ref_cells = shared_myeloid_reference_clean, gene_order_file = gene_order_file, n_threads = 1
+)
+res_pde_v2 <- run_infercnv_shared_reference(
+  seurat_obj = pde_diet, combined_obj = combined_for_ref, pool_label = "PDE",
+  fixed_ref_cells = shared_myeloid_reference_clean, gene_order_file = gene_order_file, n_threads = 1
+)
+
+# Tag both result objects with the reference cell set that produced them.
+
+attr(res_gb_v2,  "ref_cells_used") <- shared_myeloid_reference_clean
+attr(res_pde_v2, "ref_cells_used") <- shared_myeloid_reference_clean
+
+saveRDS(res_gb_v2,  "res_gb_v2.rds")
+saveRDS(res_pde_v2, "res_pde_v2.rds")
+```
+
+```{r infercnv-load-results}
+
+is_stale <- function(obj) {
+  ref <- attr(obj, "ref_cells_used")
+  is.null(ref) || !identical(sort(ref), sort(shared_myeloid_reference_clean))
+}
+
+if (!exists("res_gb_v2") || is_stale(res_gb_v2)) {
+  if (!file.exists("res_gb_v2.rds")) {
+    stop(
+      "res_gb_v2 is missing or stale (reference set = ",
+      length(shared_myeloid_reference_clean), " cells) and no res_gb_v2.rds ",
+      "was found on disk either. Run the 'infercnv-run' chunk interactively ",
+      "once (it is eval=FALSE, several minutes per cluster)."
+    )
+  }
+  res_gb_v2 <- readRDS("res_gb_v2.rds")
+  if (is_stale(res_gb_v2)) {
+    stop(
+      "STALE CACHE: res_gb_v2.rds on disk was computed with a different ",
+      "reference cell set than the one currently in this session (",
+      length(shared_myeloid_reference_clean), " cells). Delete res_gb_v2.rds ",
+      "and re-run the 'infercnv-run' chunk interactively once."
+    )
+  }
+}
+
+if (!exists("res_pde_v2") || is_stale(res_pde_v2)) {
+  if (!file.exists("res_pde_v2.rds")) {
+    stop(
+      "res_pde_v2 is missing or stale (reference set = ",
+      length(shared_myeloid_reference_clean), " cells) and no res_pde_v2.rds ",
+      "was found on disk either. Run the 'infercnv-run' chunk interactively ",
+      "once (it is eval=FALSE, several minutes per cluster)."
+    )
+  }
+  res_pde_v2 <- readRDS("res_pde_v2.rds")
+  if (is_stale(res_pde_v2)) {
+    stop(
+      "STALE CACHE: res_pde_v2.rds on disk was computed with a different ",
+      "reference cell set than the one currently in this session (",
+      length(shared_myeloid_reference_clean), " cells). Delete res_pde_v2.rds ",
+      "and re-run the 'infercnv-run' chunk interactively once."
+    )
+  }
+}
+```
+
+```{r infercnv-collect}
+profiles_gb_v2  <- collect_chr_profiles(res_gb_v2)
+profiles_pde_v2 <- collect_chr_profiles(res_pde_v2)
+
+chr_score_summary_v2 <- do.call(rbind, c(
+  lapply(names(profiles_gb_v2),  function(cl) data.frame(pool = "GB",  cluster = cl,
+         score_chr7_minus_chr10 = profiles_gb_v2[[cl]]$score_chr7_minus_chr10, n_cells = profiles_gb_v2[[cl]]$n_cells)),
+  lapply(names(profiles_pde_v2), function(cl) data.frame(pool = "PDE", cluster = cl,
+         score_chr7_minus_chr10 = profiles_pde_v2[[cl]]$score_chr7_minus_chr10, n_cells = profiles_pde_v2[[cl]]$n_cells))
+))
+chr_score_summary_v2$cluster_label <- paste0(chr_score_summary_v2$pool, "_cluster", chr_score_summary_v2$cluster)
+print(chr_score_summary_v2[order(chr_score_summary_v2$pool, -chr_score_summary_v2$score_chr7_minus_chr10), ])
+```
+
+```{r infercnv-bar, fig.width=5.5, fig.height=4.5}
+# FIGURE: BODY -- CNV-based HGG score per genetic cluster
+p_bar_v2 <- ggplot(chr_score_summary_v2,
+                    aes(x = reorder(cluster_label, -score_chr7_minus_chr10), y = score_chr7_minus_chr10, fill = pool)) +
+  geom_col() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  scale_fill_manual(values = c("GB" = "#2C7FB8", "PDE" = "#D95F02")) +
+  labs(title = "CNV-based HGG score per cluster", x = "Genetic cluster (Souporcell)",
+       y = "chr7 - chr10 score", fill = "Pool") +
+  theme_thesis() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+p_bar_v2
+save_thesis(p_bar_v2, "figure_chr7_chr10_score_per_cluster_v2.png", FIG_SINGLE)
+```
+
+```{r infercnv-pairing}
+# HGG clusters confirmed by the score table above : tissue = clusters 0 & 1;
+# PDE = clusters 0, 2 & 3 (all three turn out to be the same patient)
+hgg_clusters_gb_v2  <- c("0", "1")
+hgg_clusters_pde_v2 <- c("0", "2", "3")
+
+pairing_v2 <- expand.grid(gb_cluster = hgg_clusters_gb_v2, pde_cluster = hgg_clusters_pde_v2, stringsAsFactors = FALSE)
+pairing_v2$correlation <- mapply(function(cl_gb, cl_pde) {
+  g1 <- profiles_gb_v2[[cl_gb]]$mean_gene_profile
+  g2 <- profiles_pde_v2[[cl_pde]]$mean_gene_profile
+  common <- intersect(names(g1), names(g2))
+  cor(g1[common], g2[common], method = "pearson")
+}, pairing_v2$gb_cluster, pairing_v2$pde_cluster)
+
+pde_pairs_v2 <- combn(hgg_clusters_pde_v2, 2, simplify = FALSE)
+pde_internal_cor_v2 <- do.call(rbind, lapply(pde_pairs_v2, function(pair) {
+  g1 <- profiles_pde_v2[[pair[1]]]$mean_gene_profile
+  g2 <- profiles_pde_v2[[pair[2]]]$mean_gene_profile
+  common <- intersect(names(g1), names(g2))
+  data.frame(cluster_A = pair[1], cluster_B = pair[2], correlation = cor(g1[common], g2[common], method = "pearson"))
+}))
+pde_internal_full <- rbind(
+  pde_internal_cor_v2,
+  data.frame(cluster_A = pde_internal_cor_v2$cluster_B, cluster_B = pde_internal_cor_v2$cluster_A, correlation = pde_internal_cor_v2$correlation),
+  data.frame(cluster_A = hgg_clusters_pde_v2, cluster_B = hgg_clusters_pde_v2, correlation = 1)
+)
+```
+
+```{r infercnv-heatmap-tissue-pde, fig.width=5.5, fig.height=4.5}
+# FIGURE: BODY -- tissue <-> PDE CNV fingerprint correlation
+p_heat_v2 <- ggplot(pairing_v2, aes(x = paste0("PDE_", pde_cluster), y = paste0("GB_", gb_cluster), fill = correlation)) +
+  geom_tile(color = "white", linewidth = 1) +
+  geom_text(aes(label = sprintf("%.3f", correlation)), size = 4) +
+  scale_fill_gradient2(low = "white", mid = "#FED976", high = "#B10026", midpoint = 0.5, limits = c(0, 1), name = "Pearson r") +
+  labs(title = "CNV fingerprint correlation: tissue vs PDE", x = "PDE cluster", y = "Tissue cluster") +
+  theme_thesis() + coord_fixed()
+p_heat_v2
+save_thesis(p_heat_v2, "figure_tissue_pde_correlation_heatmap_v2.png", FIG_SINGLE)
+```
+
+```{r infercnv-heatmap-pde-internal, fig.width=5.5, fig.height=4.5}
+# FIGURE: BODY -- are PDE0/PDE2/PDE3 the same patient?
+p_heat_pde_internal <- ggplot(pde_internal_full, aes(x = paste0("PDE_", cluster_A), y = paste0("PDE_", cluster_B), fill = correlation)) +
+  geom_tile(color = "white", linewidth = 1) +
+  geom_text(aes(label = sprintf("%.3f", correlation)), size = 4) +
+  scale_fill_gradient2(low = "white", mid = "#FED976", high = "#B10026", midpoint = 0.5, limits = c(0, 1), name = "Pearson r") +
+  labs(title = "PDE clusters vs each other", x = NULL, y = NULL) +
+  theme_thesis() + coord_fixed()
+p_heat_pde_internal
+save_thesis(p_heat_pde_internal, "figure_pde_internal_correlation_heatmap_v2.png", FIG_SINGLE)
+```
+
+## 7. HGG-only filtering and patient mapping
+
+```{r hgg-patient-mapping}
+# Simple lookup table, per pool: which Souporcell cluster belongs to which
+# patient. patient_1 = has both tissue and PDE data; patient_2_tissue_only =
+# tissue-only HGG patient with no matching PDE population (see Section 6)
+gb_patient_map  <- c("0" = "patient_2_tissue_only", "1" = "patient_1")
+pde_patient_map <- c("0" = "patient_1", "2" = "patient_1", "3" = "patient_1")
+
+gb_obj$patient_id  <- unname(gb_patient_map[as.character(gb_obj$souporcell_cluster)])
+pde_obj$patient_id <- unname(pde_patient_map[as.character(pde_obj$souporcell_cluster)])
+
+gb_obj_hgg  <- subset(gb_obj,  subset = !is.na(patient_id))
+pde_obj_hgg <- subset(pde_obj, subset = !is.na(patient_id))
+
+table(gb_obj_hgg$patient_id); table(pde_obj_hgg$patient_id)
+```
+
+## 8. HGG-only re-integration
+
+```{r hgg-reintegration-sct}
+set.seed(1)
+gb_pde_hgg <- merge(gb_obj_hgg, y = pde_obj_hgg, project = "GB_Tissue_PDE_HGG_only")
+gb_pde_hgg <- SCTransform(gb_pde_hgg, assay = "RNA", vars.to.regress = "percent.mt",
+                           variable.features.n = 3000, verbose = FALSE, seed.use = 1)
+DefaultAssay(gb_pde_hgg) <- "SCT"
+gb_pde_hgg <- RunPCA(gb_pde_hgg, verbose = FALSE)
+```
+
+```{r hgg-elbow, fig.width=5.5, fig.height=4.5}
+# FIGURE: ANNEX -- variance explained per PC, HGG-only subset
+p_elbow <- ElbowPlot(gb_pde_hgg) + theme_thesis()
+p_elbow
+save_thesis(p_elbow, "hgg_elbow_plot.png", FIG_SINGLE)
+```
+
+```{r hgg-pc-resolution-testing, fig.width=10, fig.height=8}
+# FIGURE: ANNEX -- PC-count sensitivity check (resolution fixed at 0.5,
+# varying only the number of PCs, one variable at a time).
+plan("sequential")
+dims_to_test   <- c(8, 10, 12, 15, 20)
+umap_plots     <- list()
+cluster_counts <- c()
+
+for (n in dims_to_test) {
+  reduction_name <- paste0("integrated.rpca.", n)
+  umap_name      <- paste0("umap.", n)
+  cluster_col    <- paste0("clusters_pc", n)
+
+  gb_pde_hgg <- IntegrateLayers(gb_pde_hgg, method = RPCAIntegration, normalization.method = "SCT",
+                                 orig.reduction = "pca", new.reduction = reduction_name, dims = 1:n, verbose = FALSE)
+  gb_pde_hgg <- RunUMAP(gb_pde_hgg, reduction = reduction_name, dims = 1:n, reduction.name = umap_name, verbose = FALSE)
+  gb_pde_hgg <- FindNeighbors(gb_pde_hgg, reduction = reduction_name, dims = 1:n, verbose = FALSE)
+  gb_pde_hgg <- FindClusters(gb_pde_hgg, resolution = 0.5, verbose = FALSE)
+
+  gb_pde_hgg[[cluster_col]] <- gb_pde_hgg$seurat_clusters
+  cluster_counts[as.character(n)] <- length(unique(gb_pde_hgg[[cluster_col]][, 1]))
+
+  umap_plots[[as.character(n)]] <- DimPlot(gb_pde_hgg, reduction = umap_name, group.by = cluster_col, label = TRUE) +
+    ggtitle(paste0(n, " PCs (", cluster_counts[as.character(n)], " clusters)")) +
+    theme_thesis() + theme(legend.position = "none")
+}
+cluster_counts
+
+p_pc_test <- wrap_plots(umap_plots, ncol = 3) & theme_thesis()
+p_pc_test
+save_thesis(p_pc_test, "hgg_pc_testing_grid.png", FIG_GRID2x2)
+```
+
+```{r hgg-resolution-testing, fig.width=10, fig.height=8}
+# FIGURE: ANNEX -- final check: 12 vs 10 PCs, resolution 0.3 vs 0.5
+gb_pde_hgg <- IntegrateLayers(gb_pde_hgg, method = RPCAIntegration, normalization.method = "SCT",
+                               orig.reduction = "pca", new.reduction = "integrated.rpca", dims = 1:12, verbose = FALSE)
+gb_pde_hgg <- RunUMAP(gb_pde_hgg, reduction = "integrated.rpca", dims = 1:12, reduction.name = "umap.integrated")
+gb_pde_hgg <- FindNeighbors(gb_pde_hgg, reduction = "integrated.rpca", dims = 1:12)
+gb_pde_hgg <- FindClusters(gb_pde_hgg, resolution = c(0.3, 0.5))
+
+gb_pde_hgg$clusters_pc12_res05 <- gb_pde_hgg$SCT_snn_res.0.5
+gb_pde_hgg$clusters_pc12_res03 <- gb_pde_hgg$SCT_snn_res.0.3
+gb_pde_hgg$clusters_pc10_res05 <- gb_pde_hgg$clusters_pc10
+
+gb_pde_hgg <- FindNeighbors(gb_pde_hgg, reduction = "integrated.rpca.10", dims = 1:10, verbose = FALSE)
+gb_pde_hgg <- FindClusters(gb_pde_hgg, resolution = 0.3, verbose = FALSE)
+gb_pde_hgg$clusters_pc10_res03 <- gb_pde_hgg$seurat_clusters
+
+p1 <- DimPlot(gb_pde_hgg, reduction = "umap.integrated", group.by = "clusters_pc12_res05", label = TRUE) +
+  ggtitle("12 PCs, resolution 0.5") + theme_thesis() + theme(legend.position = "none")
+p2 <- DimPlot(gb_pde_hgg, reduction = "umap.integrated", group.by = "clusters_pc12_res03", label = TRUE) +
+  ggtitle("12 PCs, resolution 0.3") + theme_thesis() + theme(legend.position = "none")
+p3 <- DimPlot(gb_pde_hgg, reduction = "umap.10", group.by = "clusters_pc10_res05", label = TRUE) +
+  ggtitle("10 PCs, resolution 0.5") + theme_thesis() + theme(legend.position = "none")
+p4 <- DimPlot(gb_pde_hgg, reduction = "umap.10", group.by = "clusters_pc10_res03", label = TRUE) +
+  ggtitle("10 PCs, resolution 0.3") + theme_thesis() + theme(legend.position = "none")
+
+p_final_check <- (p1 | p2) / (p3 | p4) + plot_annotation(title = "Final check - chosen: 12 PCs, resolution 0.5")
+p_final_check
+save_thesis(p_final_check, "hgg_final_pc_resolution_check.png", FIG_GRID2x2)
+```
+
+```{r hgg-marker-heatmap-helper}
+# Reusable helper: marker heatmap for any "clusters_pcN" / "SCT_snn_res.X"
+# column, used below to compare candidate clusterings.
+check_marker_heatmap <- function(seurat_obj, cluster_col, n_top = 5, n_cells_per_cluster = 100) {
+  Idents(seurat_obj) <- cluster_col
+  markers <- FindAllMarkers(seurat_obj, only.pos = TRUE, logfc.threshold = 0.25, min.pct = 0.25)
+
+
+  if (nrow(markers) == 0 || !"cluster" %in% colnames(markers)) {
+    warning("check_marker_heatmap(): no markers passed the thresholds for '",
+            cluster_col, "' -- skipping this heatmap (likely two very similar ",
+            "clusters at this resolution). Not necessarily a problem, but worth ",
+            "noting if this clustering is a serious candidate.")
+    return(invisible(NULL))
+  }
+
+  top_markers <- markers %>% group_by(cluster) %>% slice_max(avg_log2FC, n = n_top) %>% ungroup()
+  genes_use <- top_markers$gene[top_markers$gene %in% rownames(seurat_obj[["SCT"]]$scale.data)]
+  if (length(genes_use) == 0) {
+    warning("check_marker_heatmap(): none of the top markers for '", cluster_col,
+            "' are in the SCT scale.data -- skipping this heatmap.")
+    return(invisible(NULL))
+  }
+
+  cells_use <- unlist(lapply(levels(Idents(seurat_obj)), function(cl) {
+    cells <- WhichCells(seurat_obj, idents = cl)
+    sample(cells, min(length(cells), n_cells_per_cluster))
+  }))
+  DoHeatmap(subset(seurat_obj, cells = cells_use), features = genes_use, assay = "SCT", raster = FALSE) +
+    NoLegend() + ggtitle(paste0("Markers: ", cluster_col)) + theme_thesis()
+}
+
+# Join layers before marker analysis
+## pour rejoindre ce qui a été gardé en plusieurs layers pendant l'intégration (counts.Tissue et counts.PDE)
+gb_pde_hgg <- JoinLayers(gb_pde_hgg, assay = "RNA")
+DefaultAssay(gb_pde_hgg) <- "SCT"
+gb_pde_hgg <- PrepSCTFindMarkers(gb_pde_hgg)
+```
+
+```{r hgg-marker-heatmaps-pc, fig.width=13, fig.height=4.5}
+# FIGURE: ANNEX -- marker heatmaps at 8 / 12 / 20 PCs (resolution 0.5)
+h_pc8  <- check_marker_heatmap(gb_pde_hgg, "clusters_pc8")
+h_pc12 <- check_marker_heatmap(gb_pde_hgg, "clusters_pc12")
+h_pc20 <- check_marker_heatmap(gb_pde_hgg, "clusters_pc20")
+h_pc8; h_pc12; h_pc20
+```
+
+```{r hgg-marker-heatmaps-resolution, fig.width=13, fig.height=4.5}
+# FIGURE: ANNEX -- marker heatmaps at 12 PCs, resolution 0.3 / 0.5 / 0.8 / 1.0
+check_marker_heatmap(gb_pde_hgg, "SCT_snn_res.0.3")
+check_marker_heatmap(gb_pde_hgg, "SCT_snn_res.0.5")
+check_marker_heatmap(gb_pde_hgg, "SCT_snn_res.0.8")
+check_marker_heatmap(gb_pde_hgg, "SCT_snn_res.1")
+
+
+p_marker_heatmap_final <- check_marker_heatmap(gb_pde_hgg, "SCT_snn_res.0.5")
+p_marker_heatmap_final
+save_thesis(p_marker_heatmap_final, "figure_marker_heatmap_final_clusters.png", FIG_WIDE)
+```
+
+```{r hgg-final-clustering}
+# STOP: final choice -- 12 PCs, resolution 0.5 (see Sections above).
+gb_pde_hgg$hgg_clusters <- gb_pde_hgg$SCT_snn_res.0.5
+Idents(gb_pde_hgg) <- "hgg_clusters"
+table(gb_pde_hgg$hgg_clusters, gb_pde_hgg$condition)
+table(gb_pde_hgg$hgg_clusters, gb_pde_hgg$patient_id)
+```
+
+## 9. Per-cell CNV malignancy scoring on the final HGG-only clustering
+
+```{r malignancy-scores}
+# Map every cell's per-cell chr7-chr10 score (from the v2 inferCNV run,
+# Section 6) onto the final HGG-only clustering (Section 8).
+all_cnv_scores_v2 <- c(
+  do.call(c, unname(lapply(profiles_gb_v2,  function(p) p$score_chr7_minus_chr10_per_cell))),
+  do.call(c, unname(lapply(profiles_pde_v2, function(p) p$score_chr7_minus_chr10_per_cell)))
+)
+matched_scores_v2 <- all_cnv_scores_v2[colnames(gb_pde_hgg)]
+names(matched_scores_v2) <- colnames(gb_pde_hgg)
+gb_pde_hgg <- AddMetaData(gb_pde_hgg, metadata = matched_scores_v2, col.name = "cnv_score_chr7_chr10_v2")
+```
+
+```{r malignancy-violin, fig.width=9, fig.height=4.5}
+# FIGURE: BODY -- CNV score per cluster
+p_violin_v2 <- ggplot(gb_pde_hgg@meta.data, aes(x = hgg_clusters, y = cnv_score_chr7_chr10_v2, fill = hgg_clusters)) +
+  geom_violin(trim = TRUE) +
+  geom_boxplot(width = 0.15, fill = "white", outlier.shape = NA) +
+  labs(title = "CNV score (chr7 - chr10) per cluster", subtitle = "Higher = stronger HGG signature",
+       x = "Cluster", y = "chr7 - chr10 score") +
+  theme_thesis() + theme(legend.position = "none")
+p_violin_v2
+save_thesis(p_violin_v2, "figure_cnv_score_per_hgg_cluster_v2.png", FIG_DOUBLE)
+```
+
+```{r malignancy-table}
+# FIGURE: BODY (table) -- Wilcoxon test vs. the confirmed non-malignant
+# baseline (clusters 8 & 9: myeloid + oligodendrocyte)
+baseline_clusters  <- c("8", "9")
+baseline_scores_v2 <- na.omit(gb_pde_hgg$cnv_score_chr7_chr10_v2[gb_pde_hgg$hgg_clusters %in% baseline_clusters])
+
+malignancy_summary_v2 <- do.call(rbind, lapply(levels(gb_pde_hgg$hgg_clusters), function(cl) {
+  cluster_scores <- na.omit(gb_pde_hgg$cnv_score_chr7_chr10_v2[gb_pde_hgg$hgg_clusters == cl])
+  if (length(cluster_scores) < 2) {
+    return(data.frame(cluster = cl, n_cells_scored = length(cluster_scores), median_score = NA,
+                       median_baseline = median(baseline_scores_v2), p_value = NA, likely_malignant = NA))
+  }
+  test <- wilcox.test(cluster_scores, baseline_scores_v2, alternative = "greater")
+  data.frame(cluster = cl, n_cells_scored = length(cluster_scores), median_score = median(cluster_scores),
+             median_baseline = median(baseline_scores_v2), p_value = test$p.value, likely_malignant = test$p.value < 0.05)
+}))
+malignancy_summary_v2
+```
+
+## 10. Cluster annotation and proportions
+
+```{r cluster-annotation, fig.width=5.5, fig.height=4.5}
+# FIGURE: ANNEX -- annotated UMAP (10 clusters)
+cluster_labels <- c(
+  "0" = "OPC-like", "1" = "MES-like", "2" = "Cycling (S)", "3" = "Low confidence",
+  "4" = "Cycling (G1/S)", "5" = "Cycling (G2/M)", "6" = "NPC-like", "7" = "AC-like",
+  "8" = "Myeloid/TAM", "9" = "Oligodendrocytes"
+)
+gb_pde_hgg$cluster_annotated <- factor(unname(cluster_labels[as.character(gb_pde_hgg$hgg_clusters)]), levels = cluster_labels)
+
+p_annotated_umap <- DimPlot(gb_pde_hgg, reduction = "umap.integrated", group.by = "cluster_annotated",
+                             label = TRUE, label.size = 3.5, repel = TRUE, pt.size = 0.6) +
+  labs(title = "Annotated clusters (n = 10)") + theme_thesis()
+p_annotated_umap
+save_thesis(p_annotated_umap, "umap_clusters_annotated.png", FIG_SINGLE)
+```
+
+```{r umap-by-condition}
+# UMAP by condition
+gb_pde_hgg$condition_label <- ifelse(gb_pde_hgg$orig.ident == "GB_tissue", "GB tissue", "PDE")
+
+p_umap_condition <- DimPlot(gb_pde_hgg, reduction = "umap.integrated", group.by = "condition_label",
+                             cols = c("GB tissue" = "#E76F51", "PDE" = "#2A9D8F")) +
+  labs(title = "UMAP by condition", color = "Condition") +
+  theme_thesis()
+
+
+p_umap_condition
+save_thesis(p_umap_condition, "umap_by_condition.png", FIG_SINGLE)
+```
+
+```{r umap-split-condition}
+# UMAP sepratated ; PDE vs GB tissue
+
+gb_pde_hgg$condition_label <- factor(ifelse(gb_pde_hgg$orig.ident == "GB_tissue", "GB tissue", "PDE"),
+                                      levels = c("GB tissue", "PDE"))
+
+p_annotated_umap_split <- DimPlot(gb_pde_hgg, reduction = "umap.integrated", group.by = "cluster_annotated",
+                                   split.by = "condition_label", label = TRUE, label.size = 3,
+                                   repel = TRUE, pt.size = 0.6) +
+  theme_thesis() + theme(legend.position = "right")
+
+p_annotated_umap_split
+save_thesis(p_annotated_umap_split, "umap_clusters_annotated_split_condition.png", FIG_WIDE)
+```
+
+```{r cluster-proportions, fig.width=5.5, fig.height=4.5}
+# FIGURE: ANNEX -- cluster composition, tissue vs PDE
+## Percent of each cluster within each condition (since we have way more cells in PDE data than tissue data)
+comp_df <- gb_pde_hgg@meta.data %>%
+  mutate(condition_label = ifelse(orig.ident == "GB_tissue", "GB (tissue)", "PDE")) %>%
+  dplyr::count(condition_label, cluster_annotated) %>%
+  group_by(condition_label) %>% mutate(pct = 100 * n / sum(n)) %>% ungroup()
+
+p_proportions <- ggplot(comp_df, aes(x = condition_label, y = pct, fill = cluster_annotated)) +
+  geom_col(width = 0.5) +
+  labs(title = "Cluster composition: tissue vs PDE", x = NULL, y = "% of cells", fill = "Cluster") +
+  theme_thesis()
+p_proportions
+save_thesis(p_proportions, "proportion_clusters_GB_vs_PDE_stacked.png", FIG_SINGLE)
+```
+
+## 11. Neftel / Nomura cell-state scoring of the cycling clusters
+
+Gene signatures below are taken verbatim from the published supplementary
+tables (Neftel et al. 2019, Cell, Table S2; Nomura et al. 2025, Nat Genet,
+Supplementary Table 2) -- nothing invented or guessed.
+
+```{r neftel-nomura-signatures}
+neftel_mes2 <- c("HILPDA","ADM","DDIT3","NDRG1","HERPUD1","DNAJB9","TRIB3","ENO2","AKAP12","SQSTM1","MT1X","ATF3","NAMPT","NRN1","SLC2A1","BNIP3","LGALS3","INSIG2","IGFBP3","PPP1R15A","VIM","PLOD2","GBE1","SLC2A3","FTL","WARS","ERO1L","XPOT","HSPA5","GDF15","ANXA2","EPAS1","LDHA","P4HA1","SERTAD1","PFKP","PGK1","EGLN3","SLC6A6","CA9","BNIP3L","RPL21","TRAM1","UFM1","ASNS","GOLT1B","ANGPTL4","SLC39A14","CDKN1A","HSPA9")
+neftel_mes1 <- c("CHI3L1","ANXA2","ANXA1","CD44","VIM","MT2A","C1S","NAMPT","EFEMP1","C1R","SOD2","IFITM3","TIMP1","SPP1","A2M","S100A11","MT1X","S100A10","FN1","LGALS1","S100A16","CLIC1","MGST1","RCAN1","TAGLN2","NPC2","SERPING1","C8orf4","EMP1","APOE","CTSB","C3","LGALS3","MT1E","EMP3","SERPINA3","ACTN1","PRDX6","IGFBP7","SERPINE1","PLP2","MGP","CLIC4","GFPT2","GSN","NNMT","TUBA1C","GJA1","TNFRSF1A","WWTR1")
+neftel_ac   <- c("CST3","S100B","SLC1A3","HEPN1","HOPX","MT3","SPARCL1","MLC1","GFAP","FABP7","BCAN","PON2","METTL7B","SPARC","GATM","RAMP1","PMP2","AQP4","DBI","EDNRB","PTPRZ1","CLU","PMP22","ATP1A2","S100A16","HEY1","PCDHGC3","TTYH1","NDRG2","PRCP","ATP1B2","AGT","PLTP","GPM6B","F3","RAB31","PPAP2B","ANXA5","TSPAN7")
+neftel_opc  <- c("BCAN","PLP1","GPR17","FIBIN","LHFPL3","OLIG1","PSAT1","SCRG1","OMG","APOD","SIRT2","TNR","THY1","PHYHIPL","SOX2-OT","NKAIN4","LPPR1","PTPRZ1","VCAN","DBI","PMP2","CNP","TNS3","LIMA1","CA10","PCDHGC3","CNTN1","SCD5","P2RX7","CADM2","TTYH1","FGF12","TMEM206","NEU4","FXYD6","RNF13","RTKN","GPM6B","LMF1","ALCAM","PGRMC1","HRASLS","BCAS1","RAB31","PLLP","FABP5","NLGN3","SERINC5","EPB41L2","GPR37L1")
+neftel_npc1 <- c("DLL3","DLL1","SOX4","TUBB3","HES6","TAGLN3","NEU4","MARCKSL1","CD24","STMN1","TCF12","BEX1","OLIG1","MAP2","FXYD6","PTPRS","MLLT11","NPPA","BCAN","MEST","ASCL1","BTG2","DCX","NXPH1","HN1","PFN2","SCG3","MYT1","CHD7","GPR56","TUBA1A","PCBP4","ETV1","SHD","TNR","AMOTL2","DBN1","HIP1","ABAT","ELAVL4","LMF1","GRIK2","SERINC5","TSPAN13","ELMO1","GLCCI1","SEZ6L","LRRN1","SEZ6","SOX11")
+neftel_npc2 <- c("STMN2","CD24","RND3","HMP19","TUBB3","MIAT","DCX","NSG1","ELAVL4","MLLT11","DLX6-AS1","SOX11","NREP","FNBP1L","TAGLN3","STMN4","DLX5","SOX4","MAP1B","RBFOX2","IGFBPL1","STMN1","HN1","TMEM161B-AS1","DPYSL3","SEPT3","PKIA","ATP1B1","DYNC1I1","CD200","SNAP25","PAK3","NDRG4","KIF5A","UCHL1","ENO2","KIF5C","DDAH2","TUBB2A","LBH","LOC150568","TCF4","GNG3","NFIB","DPYSL5","CRABP1","DBN1","NFIX","CEP170","BLCAP")
+
+nomura_mp2_opc     <- c("CSMD1","TNR","LHFPL3","DSCAM","NXPH1","SLC24A3","OPCML","SEZ6L","AC007402.1","MTSS1","XYLT1","KCND2","KCNQ1OT1","DSCAML1","FGF14","GLCCI1","GRIK2","PCDH15","HIP1","XKR4","MMP16","SEMA5A","SNTG1","CNTN1","ETV1","EPN2","CHST11","NRXN1","SMOC1","CADM2","GRIK3","LRRC4C","LINC02588","GRID2","IL1RAPL1","CHD7","GRIA2","LRRN1","MAP3K1","CDH20","LINC01322","MEGF11","PID1","BEST3","GALNT13","MDGA2","SERINC5","SLC2A13","CSMD3","DCC")
+nomura_mp4_ac      <- c("GLIS3","ADGRV1","GFAP","ADCY2","RFX4","KCNN3","ITPKB","LRIG1","DPP10","ARHGEF4","DCLK1","RGMA","CD44","LIFR","AQP4","FAM189A2","ASTN2","BMPR1B","GPC5","ITPR2","NKAIN3","PTCHD1-AS","AQP4-AS1","NRG3","FMN2","LINC01088","WDR49","AGBL4","AHCYL1","DNAH7","PARD3B","PITPNC1","AC079385.1","NTM","PLEKHA5","GRAMD2B","NEAT1","NEBL","NTRK2","RNF19A","SORBS1","CFAP54","SLC4A4","TNC","CADPS","F3","RYR3","CTNNA2","PACRG","ANOS1")
+nomura_mp5_hypoxia <- c("VEGFA","AKAP12","NDRG1","GBE1","HILPDA","IGFBP5","TCAF2","ADAMTS9-AS2","BNIP3L","PLOD2","PGK1","CA12","ARRDC3","PDK1","DNAH11","ERO1A","INSIG2","SLC2A3","GRB10","ADM","SORCS3","UBC","HIF1A-AS2","PFKFB4","ADCY8","P4HA1","PRELID2","ANGPTL4","HSPA9","ESYT2","IARS","NAMPT","ITPR1","MYO1E","OXR1","SLC39A14","ANKRD28","EPAS1","MEF2A","NPAS2","PFKP","PAM","SCARB1","AC025159.1","KDM3A","RNMT","SLC22A23","AC107021.1","EGLN3","C4ORF47")
+nomura_mp6_mes     <- c("GAP43","TNC","IL1RAP","CHI3L1","MIR4435-2HG","WWTR1","ADAM12","CLIC4","FRMD5","HIVEP3","NAMPT","VMP1","HRH1","PGM2L1","CD44","SERPINE1","ABCC3","EMP1","ACTN1","ARSJ","LONRF2","CYTOR","NRP2","ADAMTS9","VAV3","BCAT1","ITGA7","AC017002.5","ANXA2","FAM20C","GALR1","PHC2","SPOCD1","MIR222HG","AC124254.1","JAG1","LYST","MAP1B","VCL","CADPS","CSMD2","FAM129A","ITGA3","ELL2","FAM78B","GRB10","IGF2BP2","SAMD4A","SLC4A7","OSBP2")
+nomura_mp7_npc     <- c("PAK3","KCNH7","CASC15","DCX","NEDD4L","SOX11","MYT1L","DCC","NRXN3","PLXNA4","MIAT","CERS6","FRMD4A","SOX4","CLSTN2","DLX6-AS1","ELAVL4","KALRN","KIAA1211","PTPRN2","PTPRS","DSCAML1","UNC79","CNTNAP5","TOX3","XKR4","BCL11A","CEMIP2","HECW1","PLCB1","SEZ6L","SLAIN1","STMN2","DCLK1","NRXN1","THSD7A","TOX","ANK3","MAML3","MARCH1","MTSS1","ROBO2","SETBP1","ANKS1B","CTNNA2","ERBB4","GSE1","NBAT1","RND3","AC008056.1")
+nomura_mp8_gpc     <- c("SLC4A4","KCNIP1","DGKG","TRPM3","VAV3","RYR3","ALK","ATP13A4","ADAMTS9","ACSBG1","CPNE4","GRIA1","GRIK1","HIVEP3","KLHL29","PDZD2","COL23A1","COL25A1","DLGAP1","ELOVL2","ETV1","FAT3","RGS6","SLC1A2","SLC24A3","ARHGAP26","CDH20","GNG7","KLHDC8A","KLHL4","LAMA2","MEOX2","ADAM19","AGMO","CDH4","DISC1","MEIS1","PTPRJ","SEC14L1","SHROOM3","SEZ6L","EGFR","AC007402.1","AC109492.1","DGKZ","SPRED2","RHOJ","MIR4435-2HG","SEMA5A","LHFPL3")
+nomura_mp13_cilia  <- c("CFAP54","DNAH6","DNAH9","SPATA17","WDR49","DNAH7","VWA3A","ZBBX","CFAP43","DCDC1","DNAH11","FHAD1","HYDIN","PACRG","AC013470.2","C8ORF34","CASC1","CCDC30","CFAP52","CFAP61","CFAP73","DTHD1","LMNTD1","SERPINI2","TCTEX1D1","TMEM232","TTLL9","ARMC2","ARMC3","C4ORF47","CCDC40","CFAP157","CFAP299","DNAH12","ERICH3","LINC01088","NEK11","RFX2","AC104078.2","TEKT1","TTC29","WDR78","TOGARAM2","LRGUK","AGBL4","CEP126","ADGB","DRC1","TSGA10","CCDC173")
+nomura_mp9_exn     <- c("RBFOX1","CNTNAP2","NRXN3","CCSER1","RYR2","TENM2","KCNIP4","ANKS1B","DLGAP2","RIMS2","AC011287.1","CDH18","CNTN5","NRG1","OPCML","PTPRD","CSMD1","CSMD3","DLGAP1","RALYL","AGBL4","EYS","GALNT17","IL1RAPL1","MACROD2","NKAIN2","CALN1","DPP10","IQCJ-SCHIP1","LRRC7","SYT1","CACNA1B","DAB1","DMD","DSCAM","GALNTL6","HS6ST3","LRRTM4","MYT1L","NRG3","PTPRT","ZFPM2","NEGR1","DLG2","FRMD4A","SYN3","STXBP5L","ATP8A2","CDH13","FGF14")
+nomura_mp14_nrgn   <- c("ATP1B1","IDS","SERINC1","CALM1","HSP90AB1","PRNP","SARAF","TSPAN7","CREG2","DKK3","ENC1","NORAD","OLFM1","PCSK1N","SYT1","THY1","CALM3","CLSTN1","FAIM2","GABRA1","HSP90AA1","NEFL","NRGN","RTN3","TUBA1B","VSNL1","YWHAH","ATP1A1","ATP6AP1","CAMK2A","CAMK2N1","CHGB","GABRB2","GAPDH","HSPA5","PSAP","RTN1","SNAP25","STMN2","UCHL1","YWHAB","YWHAG","NPTXR","APLP2","BSG","HSP90B1","PGRMC1","BASP1","MAP1B","SPARCL1")
+nomura_mp10_stress1<- c("IARS","HSPA9","USP36","ARF4","GFPT1","MORF4L2","GARS","GBE1","HSPA5","SEC24D","SND1","AC139887.2","SEC31A","XPOT","HM13","MDM2","RNMT","SRP54","AFF3","BNIP3L","CALU","CPED1","KCNQ1OT1","NOP58","TBC1D15","TXNRD1","AL357153.2","CCPG1","MARS","SQSTM1","DMGDH","EIF2AK3","ELP2","FAM129A","HBP1","HSPD1","HSPH1","LARP1B","LUCAT1","PMM2","SEC61A1","SLC38A1","UFM1","WARS","YARS","GPC5","LINC01505","RPS27L","TBC1D23","BET1")
+nomura_mp15_stress2<- c("CACYBP","CHORDC1","DNAJB6","FXR1","HSP90AA1","HSP90AB1","HSPB1","HSPD1","HSPH1","TCP1","USPL1","ACSL3","DNAJA1","DNAJB1","HSPA1A","HSPA1B","HSPA9","JAM3","NOP58","STIP1","UBB","UBE2B","ABHD3","ATP2C1","BNIP3","DPM1","HMGCS1","HSPA6","INSIG2","MEST","NDRG1","P4HA1","PLOD2","PPP2CB","HSPA4L","MSMO1","HMGCR","SERPINH1","HSPA4","AHSA1","MBNL2","CCT4","FDFT1","UBC","SLC2A3","ING3","ATP6V1A","YWHAG","CECR2","AFF1")
+
+nomura_identity_signatures <- list(
+  OPC = nomura_mp2_opc, AC = nomura_mp4_ac, Hypoxia = nomura_mp5_hypoxia, MES = nomura_mp6_mes,
+  NPC = nomura_mp7_npc, GPC = nomura_mp8_gpc, Cilia = nomura_mp13_cilia
+)
+```
+
+```{r cycling-cluster-scoring}
+# STEP 1-2: identity module scores (Neftel's 4 non-cycling states, Nomura's
+# 7 non-cycling states). Never score "cycling" itself here -- that would be
+# circular, given we're trying to explain what the cycling clusters ARE.
+#
+# Score on normalized RNA (not the current default assay, SCT, left over
+# from the marker-heatmap step above) for the same reason as Section 5: SCT
+# Pearson residuals can produce too many tied values for AddModuleScore's
+# internal 24-bin control-gene matching on a marker panel this size.
+gb_pde_hgg <- NormalizeData(gb_pde_hgg, assay = "RNA", verbose = FALSE)
+
+gb_pde_hgg <- AddModuleScore(
+  gb_pde_hgg,
+  features = list(neftel_mes1, neftel_mes2, neftel_ac, neftel_opc, neftel_npc1, neftel_npc2),
+  name = c("Neftel_MES1", "Neftel_MES2", "Neftel_AC", "Neftel_OPC", "Neftel_NPC1", "Neftel_NPC2"),
+  assay = "RNA"
+)
+gb_pde_hgg <- AddModuleScore(
+  gb_pde_hgg,
+  features = list(nomura_identity_signatures$OPC, nomura_identity_signatures$AC, nomura_identity_signatures$MES,
+                   nomura_identity_signatures$NPC, nomura_identity_signatures$Hypoxia, nomura_identity_signatures$GPC,
+                   nomura_identity_signatures$Cilia),
+  name = c("Nomura_OPC", "Nomura_AC", "Nomura_MES", "Nomura_NPC", "Nomura_Hypoxia", "Nomura_GPC", "Nomura_Cilia"),
+  assay = "RNA"
+)
+gb_pde_hgg <- AddModuleScore(
+  gb_pde_hgg, features = list(c(nomura_mp9_exn, nomura_mp14_nrgn), c(nomura_mp10_stress1, nomura_mp15_stress2)),
+  name = c("Nomura_NEU", "Nomura_Stress"), assay = "RNA"
+)
+
+# Seurat appends its own counter to each name above (e.g. our "Neftel_MES1"
+# -> column "Neftel_MES11"); map explicitly rather than guess with regex.
+label_map <- c(
+  "Neftel_MES11" = "MES1", "Neftel_MES22" = "MES2", "Neftel_AC3" = "AC", "Neftel_OPC4" = "OPC",
+  "Neftel_NPC15" = "NPC1", "Neftel_NPC26" = "NPC2", "Nomura_OPC1" = "OPC", "Nomura_AC2" = "AC",
+  "Nomura_MES3" = "MES", "Nomura_NPC4" = "NPC", "Nomura_Hypoxia5" = "Hypoxia", "Nomura_GPC6" = "GPC",
+  "Nomura_Cilia7" = "Cilia", "Nomura_NEU1" = "NEU", "Nomura_Stress2" = "Stress"
+)
+
+cycling_cells <- subset(gb_pde_hgg, subset = hgg_clusters %in% c("2", "4", "5"))
+meta <- cycling_cells@meta.data
+```
+
+```{r cycling-cluster-heatmap, fig.width=9, fig.height=3.5}
+# FIGURE: ANNEX -- mean identity score per cycling cluster
+score_summary <- meta %>% group_by(hgg_clusters) %>% summarise(across(all_of(names(label_map)), mean), .groups = "drop")
+write.csv(score_summary, "cycling_clusters_identity_scores_FULL.csv", row.names = FALSE)
+
+score_long <- score_summary %>%
+  pivot_longer(-hgg_clusters, names_to = "raw_col", values_to = "score") %>%
+  mutate(source = ifelse(grepl("^Neftel", raw_col), "Neftel 2019", "Nomura 2025"), signature = label_map[raw_col])
+
+state_order <- c("MES1", "MES2", "MES", "AC", "OPC", "NPC1", "NPC2", "NPC", "GPC", "NEU", "Hypoxia", "Cilia", "Stress")
+score_long$signature <- factor(score_long$signature, levels = state_order[state_order %in% unique(score_long$signature)])
+
+p_cycling_heatmap <- ggplot(score_long, aes(x = signature, y = hgg_clusters, fill = score)) +
+  geom_tile(color = "white", linewidth = 1) +
+  scale_fill_gradient2(low = "#2a78d6", mid = "#f0efec", high = "#e34948", midpoint = 0, name = "Mean score") +
+  geom_text(aes(label = round(score, 2)), size = 3) +
+  facet_grid(~ source, scales = "free_x", space = "free_x") +
+  labs(title = "Identity scores of the cycling clusters (2, 4, 5)", x = NULL, y = "Cluster") +
+  theme_thesis() + theme(panel.grid = element_blank(), axis.text.x = element_text(angle = 45, hjust = 1))
+p_cycling_heatmap
+save_thesis(p_cycling_heatmap, "cycling_clusters_identity_heatmap.png", FIG_DOUBLE)
+```
+
+```{r cycling-cluster-percell, fig.width=9, fig.height=4.5}
+# FIGURE: ANNEX -- per-cell classification (whichever score wins for that
+# cell), % of cells per identity per cluster.
+meta$Neftel_MES_max <- pmax(meta$Neftel_MES11, meta$Neftel_MES22)
+meta$Neftel_NPC_max <- pmax(meta$Neftel_NPC15, meta$Neftel_NPC26)
+neftel_matrix <- as.matrix(meta[, c("Neftel_MES_max", "Neftel_AC3", "Neftel_OPC4", "Neftel_NPC_max")])
+colnames(neftel_matrix) <- c("MES", "AC", "OPC", "NPC")
+neftel_max <- apply(neftel_matrix, 1, max)
+meta$Neftel_call <- ifelse(neftel_max > 0, colnames(neftel_matrix)[max.col(neftel_matrix, ties.method = "first")], "Unresolved")
+
+nomura_matrix <- as.matrix(meta[, c("Nomura_MES3", "Nomura_AC2", "Nomura_OPC1", "Nomura_NPC4", "Nomura_GPC6",
+                                     "Nomura_NEU1", "Nomura_Hypoxia5", "Nomura_Cilia7", "Nomura_Stress2")])
+colnames(nomura_matrix) <- c("MES", "AC", "OPC", "NPC", "GPC", "NEU", "Hypoxia", "Cilia", "Stress")
+nomura_max <- apply(nomura_matrix, 1, max)
+meta$Nomura_call <- ifelse(nomura_max > 0, colnames(nomura_matrix)[max.col(nomura_matrix, ties.method = "first")], "Unresolved")
+
+meta$hgg_clusters <- droplevels(meta$hgg_clusters)
+neftel_pct <- as.data.frame(round(100 * prop.table(table(hgg_clusters = meta$hgg_clusters, Neftel_call = meta$Neftel_call), margin = 1), 1))
+colnames(neftel_pct) <- c("hgg_clusters", "call", "pct")
+nomura_pct <- as.data.frame(round(100 * prop.table(table(hgg_clusters = meta$hgg_clusters, Nomura_call = meta$Nomura_call), margin = 1), 1))
+colnames(nomura_pct) <- c("hgg_clusters", "call", "pct")
+
+identity_colors <- c(MES = "#2a78d6", AC = "#eb6834", OPC = "#1baf7a", NPC = "#eda100", GPC = "#e87ba4",
+                     NEU = "#008300", Hypoxia = "#4a3aa7", Stress = "#e34948", Cilia = "#c3c2b7", Unresolved = "#898781")
+
+p1 <- ggplot(neftel_pct, aes(x = hgg_clusters, y = pct, fill = call)) + geom_col(width = 0.7, color = "white") +
+  scale_fill_manual(values = identity_colors, name = "Identity") + labs(title = "Neftel 2019 (4 states)", x = "Cluster", y = "% of cells") + theme_thesis()
+p2 <- ggplot(nomura_pct, aes(x = hgg_clusters, y = pct, fill = call)) + geom_col(width = 0.7, color = "white") +
+  scale_fill_manual(values = identity_colors, name = "Identity") + labs(title = "Nomura 2025 (9 states)", x = "Cluster", y = "% of cells") + theme_thesis()
+
+p_percell <- (p1 | p2) + plot_annotation(title = "Per-cell identity classification, cycling clusters (2, 4, 5)")
+p_percell
+save_thesis(p_percell, "cycling_clusters_percell_classification.png", FIG_DOUBLE)
+```
+
+## 12. Butterfly plots (malignant cell states)
+
+```{r butterfly-prep}
+meta_all <- gb_pde_hgg@meta.data
+meta_all <- droplevels(meta_all[!meta_all$hgg_clusters %in% c("3", "8", "9"), ])  # non-malignant + low-confidence excluded
+
+meta_all$SC_mes <- pmax(meta_all$Neftel_MES11, meta_all$Neftel_MES22)
+meta_all$SC_npc <- pmax(meta_all$Neftel_NPC15, meta_all$Neftel_NPC26)
+meta_all$SC_ac  <- meta_all$Neftel_AC3
+meta_all$SC_opc <- meta_all$Neftel_OPC4
+
+meta_all$D <- pmax(meta_all$SC_opc, meta_all$SC_npc) - pmax(meta_all$SC_ac, meta_all$SC_mes)
+meta_all$Y <- sign(meta_all$D) * log2(abs(meta_all$D) + 1)
+meta_all$X <- ifelse(meta_all$D > 0,
+                      sign(meta_all$SC_npc - meta_all$SC_opc) * log2(abs(meta_all$SC_opc - meta_all$SC_npc) + 1),
+                      sign(meta_all$SC_mes - meta_all$SC_ac)  * log2(abs(meta_all$SC_ac  - meta_all$SC_mes) + 1))
+
+x_max <- max(meta_all$X, na.rm = TRUE); x_min <- min(meta_all$X, na.rm = TRUE)
+y_max <- max(meta_all$Y, na.rm = TRUE); y_min <- min(meta_all$Y, na.rm = TRUE)
+
+butterfly_base <- list(
+  geom_point(size = 1.3, alpha = 0.7),
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50"),
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50"),
+  annotate("text", x = x_max * 0.95, y = y_max * 1.12, label = "NPC-like", fontface = "bold"),
+  annotate("text", x = x_min * 0.95, y = y_max * 1.12, label = "OPC-like", fontface = "bold"),
+  annotate("text", x = x_max * 0.95, y = y_min * 1.12, label = "MES-like", fontface = "bold"),
+  annotate("text", x = x_min * 0.95, y = y_min * 1.12, label = "AC-like",  fontface = "bold"),
+  coord_equal(clip = "off"),
+  scale_x_continuous(expand = expansion(mult = 0.20)),
+  scale_y_continuous(expand = expansion(mult = 0.20)),
+  labs(x = "Relative score (OPC <-> NPC or AC <-> MES axis)", y = "Relative score ((OPC/NPC) vs (AC/MES))", color = "Cluster"),
+  theme_thesis(), theme(plot.margin = margin(t = 20, r = 60, b = 20, l = 60))
+)
+
+```
+
+```{r butterfly-single, fig.width=6.5, fig.height=5.5}
+# FIGURE: ANNEX -- butterfly plot, all HGG cells pooled
+p_butterfly <- ggplot(meta_all, aes(x = X, y = Y, color = hgg_clusters)) + butterfly_base +
+  ggtitle("Butterfly plot: malignant cell states")
+p_butterfly
+save_thesis(p_butterfly, "butterfly_plot_malignant_only.png", list(w = FIG_SINGLE$w + 1, h = FIG_SINGLE$h + 1))
+```
+
+```{r butterfly-split, fig.width=11, fig.height=5.5}
+# FIGURE: ANNEX -- butterfly plot, split by tissue vs PDE
+meta_all$tissue_label <- ifelse(meta_all$orig.ident == "GB_tissue", "GB tissue", "PDE")
+p_butterfly_split <- ggplot(meta_all, aes(x = X, y = Y, color = hgg_clusters)) + butterfly_base +
+  facet_wrap(~ tissue_label) +
+  ggtitle("Butterfly plot: malignant cell states, GB vs PDE") +
+  theme(strip.text = element_text(face = "bold", size = 13))
+p_butterfly_split
+save_thesis(p_butterfly_split, "butterfly_plot_GB_vs_PDE.png", list(w = FIG_WIDE$w - 2, h = FIG_SINGLE$h + 1))
+```
+
+```{r composition-calls-all}
+# Neftel 4 états (MES1+MES2 -> MES, NPC1+NPC2 -> NPC), déjà groupés dans butterfly-prep (SC_mes/SC_ac/SC_opc/SC_npc) -- même logique que les axes du butterfly plot, appliquée ici à toutes les cellules malignes.
+neftel_matrix_all <- as.matrix(meta_all[, c("SC_mes", "SC_ac", "SC_opc", "SC_npc")])
+colnames(neftel_matrix_all) <- c("MES", "AC", "OPC", "NPC")
+neftel_max_all <- apply(neftel_matrix_all, 1, max)
+meta_all$Neftel_call <- ifelse(neftel_max_all > 0,
+                                colnames(neftel_matrix_all)[max.col(neftel_matrix_all, ties.method = "first")],
+                                "Unresolved")
+
+# Nomura 9 états, toutes cellules malignes (réutilise les scores déjà
+# calculés sur l'objet complet dans cycling-cluster-scoring).
+nomura_matrix_all <- as.matrix(meta_all[, c("Nomura_MES3", "Nomura_AC2", "Nomura_OPC1", "Nomura_NPC4",
+                                             "Nomura_GPC6", "Nomura_NEU1", "Nomura_Hypoxia5",
+                                             "Nomura_Cilia7", "Nomura_Stress2")])
+colnames(nomura_matrix_all) <- c("MES", "AC", "OPC", "NPC", "GPC", "NEU", "Hypoxia", "Cilia", "Stress")
+nomura_max_all <- apply(nomura_matrix_all, 1, max)
+meta_all$Nomura_call <- ifelse(nomura_max_all > 0,
+                                colnames(nomura_matrix_all)[max.col(nomura_matrix_all, ties.method = "first")],
+                                "Unresolved")
+```
+
+
+```{r nomura-percell-percent-all, fig.width=8, fig.height=5}
+# FIGURE: BODY -- % de cellules malignes par état Nomura, tissu vs PDE.
+# Analogue au bar chart "Malignant group" de Spitzer et al. 2025, mais on
+# garde les 9 états séparés (pas de regroupement OPC/NPC, pas de "Mixed"
+# fourre-tout pour Cilia/Stress), par choix.
+
+meta_all$tissue_label <- ifelse(meta_all$orig.ident == "GB_tissue", "GB tissue", "PDE")
+
+nomura_pct_all <- as.data.frame(round(100 * prop.table(
+  table(condition = meta_all$tissue_label, state = meta_all$Nomura_call), margin = 1
+), 1))
+colnames(nomura_pct_all) <- c("condition", "state", "pct")
+
+state_order <- c("AC", "OPC", "NPC", "NEU", "GPC", "Hypoxia", "MES", "Cilia", "Stress", "Unresolved")
+nomura_pct_all$state <- factor(nomura_pct_all$state, levels = state_order[state_order %in% unique(nomura_pct_all$state)])
+
+p_nomura_bar <- ggplot(nomura_pct_all, aes(x = state, y = pct, fill = condition)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.65, color = "white") +
+  scale_fill_manual(values = c("GB tissue" = "#2C7FB8", "PDE" = "#D95F02")) +
+  labs(title = "Malignant cell state composition (Nomura 2025, 9 states)",
+       x = NULL, y = "% of malignant cells", fill = NULL) +
+  theme_thesis() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+p_nomura_bar
+save_thesis(p_nomura_bar, "nomura_9states_pct_tissue_vs_PDE.png", FIG_SINGLE)
+```
+
+```{r condition-identity-heatmap, fig.width=9, fig.height=3}
+
+meta_all$tissue_label <- ifelse(meta_all$orig.ident == "GB_tissue", "GB tissue", "PDE")
+
+score_summary_condition <- meta_all %>%
+  group_by(tissue_label) %>%
+  summarise(across(all_of(names(label_map)), mean, na.rm = TRUE), .groups = "drop")
+
+score_long_condition <- score_summary_condition %>%
+  pivot_longer(-tissue_label, names_to = "raw_col", values_to = "score") %>%
+  mutate(source = ifelse(grepl("^Neftel", raw_col), "Neftel 2019", "Nomura 2025"),
+         signature = label_map[raw_col])
+
+# Nom dédié, propre à ce chunk -- n'écrase pas et n'est pas écrasé par le state_order du bar chart à 9 états (qui ne contient pas MES1/MES2/NPC1/NPC2).
+state_order_heatmap <- c("MES1", "MES2", "MES", "AC", "OPC", "NPC1", "NPC2", "NPC", "GPC", "NEU", "Hypoxia", "Cilia", "Stress")
+score_long_condition$signature <- factor(score_long_condition$signature,
+                                          levels = state_order_heatmap[state_order_heatmap %in% unique(score_long_condition$signature)])
+
+p_condition_heatmap <- ggplot(score_long_condition, aes(x = signature, y = tissue_label, fill = score)) +
+  geom_tile(color = "white", linewidth = 1) +
+  scale_fill_gradient2(low = "#2a78d6", mid = "#f0efec", high = "#e34948", midpoint = 0, name = "Mean score") +
+  geom_text(aes(label = round(score, 2)), size = 3) +
+  facet_grid(~ source, scales = "free_x", space = "free_x") +
+  labs(title = "Identity scores, GB tissue vs PDE (all malignant cells)", x = NULL, y = NULL) +
+  theme_thesis() + theme(panel.grid = element_blank(), axis.text.x = element_text(angle = 45, hjust = 1))
+p_condition_heatmap
+save_thesis(p_condition_heatmap, "identity_scores_heatmap_tissue_vs_PDE.png", list(w = FIG_WIDE$w, h = FIG_SINGLE$h - 1))
+```
+
+```{r neftel-nomura-correlation, fig.width=8, fig.height=5}
+# Corrélation par cellule entre les scores Neftel (4 états groupés, comme pour le butterfly plot et les bar charts) et les scores Nomura (9 états).
+neftel_cols_4 <- c("SC_mes", "SC_ac", "SC_opc", "SC_npc")
+nomura_cols <- c("Nomura_Hypoxia5", "Nomura_Stress2", "Nomura_NEU1", "Nomura_MES3", "Nomura_AC2",
+                  "Nomura_Cilia7", "Nomura_OPC1", "Nomura_NPC4", "Nomura_GPC6")
+
+cross_cor <- cor(meta_all[, neftel_cols_4], meta_all[, nomura_cols], use = "pairwise.complete.obs")
+rownames(cross_cor) <- c("MES", "AC", "OPC", "NPC")
+colnames(cross_cor) <- c("Hypoxia", "Stress", "NEU", "MES", "AC", "Cilia", "OPC", "NPC", "GPC")
+
+cross_cor_long <- as.data.frame(as.table(cross_cor))
+colnames(cross_cor_long) <- c("Neftel", "Nomura", "correlation")
+
+p_cross_cor <- ggplot(cross_cor_long, aes(x = Nomura, y = Neftel, fill = correlation)) +
+  geom_tile(color = "white", linewidth = 1) +
+  scale_fill_gradient2(low = "#2a78d6", mid = "white", high = "#e34948", midpoint = 0,
+                        limits = c(-0.5, 0.5), oob = scales::squish, name = "Correlation") +
+  labs(title = "Neftel vs Nomura signature scores, per-cell correlation",
+       x = "Nomura 2025 MPs", y = "Neftel 2019 MPs") +
+  theme_thesis() + theme(panel.grid = element_blank(), axis.text.x = element_text(angle = 45, hjust = 1))
+p_cross_cor
+save_thesis(p_cross_cor, "neftel_nomura_percell_correlation.png", FIG_SINGLE)
+```
+
+
+
+```{r composition-bars-styled, fig.width=13, fig.height=5.5}
+
+condition_colors <- c("GB tissue" = "#2C7FB8", "PDE" = "#D95F02")  # même palette que le chunk infercnv-bar
+
+make_styled_bar <- function(meta, call_col, state_order, title) {
+  pct <- as.data.frame(round(100 * prop.table(table(condition = meta$tissue_label, state = meta[[call_col]]), margin = 1), 1))
+  colnames(pct) <- c("condition", "state", "pct")
+  pct <- pct[pct$state %in% state_order, ]
+  pct$state <- factor(pct$state, levels = state_order)
+
+  ggplot(pct, aes(x = state, y = pct, fill = condition)) +
+    geom_col(position = position_dodge(width = 0.9), width = 0.85, color = "white", linewidth = 0.3) +
+    scale_fill_manual(values = condition_colors, name = NULL) +
+    labs(title = title, x = NULL, y = "% of malignant cells") +
+    theme_thesis() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+state_order_neftel_bar <- c("AC", "OPC", "NPC", "MES")
+state_order_nomura_bar <- c("AC", "OPC", "NPC", "NEU", "GPC", "Hypoxia", "MES", "Cilia", "Stress", "Unresolved")
+
+p_neftel_bar_v2 <- make_styled_bar(meta_all, "Neftel_call", state_order_neftel_bar, "Neftel 2019 (4 states)")
+p_nomura_bar_v2 <- make_styled_bar(meta_all, "Nomura_call", state_order_nomura_bar, "Nomura 2025 (9 states)")
+
+p_composition_bars <- (p_nomura_bar_v2 | p_neftel_bar_v2) +
+  plot_annotation(title = "Malignant cell state composition: GB tissue vs PDE")
+p_composition_bars
+save_thesis(p_composition_bars, "state_composition_bars_styled.png", FIG_WIDE)
+```
+
+```{r composition-raw-counts}
+table(condition = meta_all$tissue_label, state = meta_all$Nomura_call)
+table(condition = meta_all$tissue_label, state = meta_all$Neftel_call)
+```
+
+## 13. Feature plots (cytometry/IF marker panel)
+
+```{r featureplot-prep}
+# Color intensity is drawn from normalized RNA counts (already computed in
+# Section 11), not from SCT -- standard practice: cluster/UMAP on the
+# integrated SCT space, but visualize individual marker expression on
+# normalized RNA so every gene (not just the SCT variable-feature set) is
+# guaranteed to be available.
+DefaultAssay(gb_pde_hgg) <- "RNA"
+
+my_panel <- c("GFAP", "SOX2", "MKI67", "PECAM1", "PTPRC", "NES", "OLIG2", "EGFR")
+gb_tissue <- subset(gb_pde_hgg, subset = orig.ident == "GB_tissue")
+gb_pde    <- subset(gb_pde_hgg, subset = orig.ident == "PDE")
+
+expr_data <- FetchData(gb_pde_hgg, vars = my_panel)
+gene_max  <- apply(expr_data, 2, max)
+
+# Fixing color-scale limits per gene (instead of letting each panel
+# auto-scale) avoids an all-zero gene rendering as flat mid-blue/orange.
+#
+# `cols` is a parameter (default grey90 -> blue) so the same function can
+# render the PDE panel in a different color from the GB tissue panel below,
+# so PDE is visually distinguishable from tissue at a glance.
+make_panel <- function(obj, g, cols = c("grey90", "#2a78d6")) {
+  FeaturePlot(obj, features = g, reduction = "umap.integrated", order = TRUE,
+              cols = cols, min.cutoff = 0, max.cutoff = gene_max[g]) +
+    scale_color_gradientn(colors = cols, limits = c(0, gene_max[g])) +
+    theme_thesis() +
+    theme(
+      axis.text = element_blank(), axis.ticks = element_blank(), axis.title = element_text(size = 9),
+ 
+      plot.title = element_text(size = 17, face = "bold", hjust = 0),
+
+      legend.text = element_text(size = 13)
+    )
+}
+```
+
+```{r featureplot-panel, fig.width=13, fig.height=8}
+# FIGURE: ANNEX -- cytometry/IF marker panel, tissue vs PDE
+# GB tissue stays on the original blue scale; PDE uses an orange scale
+
+p_panel_tissue <- wrap_plots(lapply(my_panel, function(g) make_panel(gb_tissue, g)), ncol = 4) +
+  plot_annotation(title = "GB (tissue)", theme = theme(plot.title = element_text(size = 20, face = "bold")))
+p_panel_pde <- wrap_plots(lapply(my_panel, function(g) make_panel(gb_pde, g, cols = c("grey90", "#e8792a"))), ncol = 4) +
+  plot_annotation(title = "PDE", theme = theme(plot.title = element_text(size = 20, face = "bold")))
+p_panel_tissue
+p_panel_pde
+save_thesis(p_panel_tissue, "featureplot_GB_tissue.png", FIG_WIDE)
+save_thesis(p_panel_pde,    "featureplot_PDE.png", FIG_WIDE)
+```
+
+## 14. Figure 4.11 -- GB tissue vs PDE genome-wide concordance (malignant-only, patient-matched)
+
+
+```{r fig411-patient-matching-helpers}
+hgg_clusters_gb_patient1 <- c("1")  # patient_1 seulement, exclut patient_2_tissue_only
+
+# Pools several clusters' mean_gene_profile into one condition-level profile,
+# weighted by each cluster's cell count.
+pool_condition_profile <- function(profiles, clusters) {
+  mats <- lapply(clusters, function(cl) profiles[[cl]]$mean_gene_profile)
+  common_genes <- Reduce(intersect, lapply(mats, names))
+  mats <- lapply(mats, function(m) m[common_genes])
+  weights <- sapply(clusters, function(cl) profiles[[cl]]$n_cells)
+  Reduce(`+`, Map(function(m, w) m * w, mats, weights)) / sum(weights)
+}
+
+# Collapses a per-gene profile down to one mean signal value per chromosome.
+chr_profile_by_condition <- function(gene_profile, gene_order) {
+  common <- intersect(names(gene_profile), rownames(gene_order))
+  data.frame(gene = common, chr = gene_order[common, "chr"], signal = gene_profile[common]) %>%
+    group_by(chr) %>% summarise(mean_signal = mean(signal), .groups = "drop")
+}
+```
+
+```{r fig411-infercnv-runner-malignant}
+## Malignant-only version of the per-genetic-cluster inferCNV runner.
+## Identical to run_infercnv_shared_reference(), except cells_this_cluster is additionally intersected with a malignant-cell barcode list before the inferCNV run -- so non-malignant, non-myeloid cells (oligodendrocyte-like, stromal, endothelial, neuronal-like) sharing the patient's genotype are excluded too, not just the shared myeloid reference.
+
+run_infercnv_shared_reference_malignant <- function(seurat_obj, combined_obj, pool_label,
+                                                      cluster_col = "souporcell_cluster",
+                                                      fixed_ref_cells, gene_order_file,
+                                                      restrict_to,   # malignant cell barcodes
+                                                      out_dir_base = "infercnv_by_genetic_cluster_malignant",
+                                                      min_ref_cells = 30, n_threads = 4, clusters_subset = NULL) {
+
+  dir.create(out_dir_base, showWarnings = FALSE, recursive = TRUE)
+  meta <- seurat_obj@meta.data
+  stopifnot(cluster_col %in% colnames(meta))
+
+  clusters <- sort(unique(na.omit(meta[[cluster_col]])))
+  if (!is.null(clusters_subset)) clusters <- clusters[clusters %in% clusters_subset]
+
+  ref_cells <- fixed_ref_cells
+  if (length(ref_cells) < min_ref_cells) stop("Shared reference has fewer than min_ref_cells -- check filtering.")
+
+  results <- list()
+  for (cl in clusters) {
+    cells_this_cluster <- rownames(meta)[meta[[cluster_col]] == cl]
+    cells_this_cluster <- intersect(cells_this_cluster, restrict_to)   # <-- the only change vs. the original
+    n_cells <- length(cells_this_cluster)
+    message(sprintf("[%s] cluster %s: %d malignant-only cells", pool_label, cl, n_cells))
+    if (n_cells < 50) warning(sprintf("[%s] cluster %s: only %d cells (<50)", pool_label, cl, n_cells))
+
+    test_cells <- setdiff(cells_this_cluster, ref_cells)
+    obj_sub <- subset(combined_obj, cells = c(test_cells, ref_cells))
+    obj_sub <- tryCatch(JoinLayers(obj_sub), error = function(e) obj_sub)
+    counts  <- GetAssayData(obj_sub, assay = "RNA", layer = "counts")
+
+    annot <- data.frame(
+      group = ifelse(colnames(obj_sub) %in% ref_cells, "reference", paste0(pool_label, "_cluster", cl)),
+      row.names = colnames(obj_sub)
+    )
+    annot_file <- file.path(out_dir_base, sprintf("annot_%s_cluster%s.txt", pool_label, cl))
+    write.table(annot, annot_file, sep = "\t", col.names = FALSE, quote = FALSE)
+
+    out_dir <- file.path(out_dir_base, sprintf("%s_cluster%s", pool_label, cl))
+    dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+    infercnv_obj <- CreateInfercnvObject(raw_counts_matrix = counts, annotations_file = annot_file,
+                                          gene_order_file = gene_order_file, ref_group_names = "reference")
+    infercnv_obj <- infercnv::run(infercnv_obj, cutoff = 0.1, out_dir = out_dir, cluster_by_groups = TRUE,
+                                   denoise = TRUE, HMM = FALSE, num_threads = n_threads)
+
+    results[[as.character(cl)]] <- list(n_cells = n_cells, out_dir = out_dir, status = "done")
+    rm(obj_sub, counts, infercnv_obj, annot)
+    gc(verbose = FALSE)
+  }
+  results
+}
+
+## Malignant cell barcodes, same definition as panel B's malignant_cells
+malignant_cells_all <- colnames(gb_pde_hgg)[!(gb_pde_hgg$hgg_clusters %in% c("3", "8", "9"))]
+
+## Sanity check before running inferCNV -- if either count is ~0, the
+## barcodes don't match between gb_pde_hgg and gb_diet/pde_diet (e.g. a
+## merge() suffix) and must be fixed before going further.
+message("GB patient_1 cluster, malignant-only overlap: ",
+        length(intersect(rownames(gb_diet@meta.data)[gb_diet$souporcell_cluster %in% hgg_clusters_gb_patient1],
+                          malignant_cells_all)))
+message("PDE clusters, malignant-only overlap: ",
+        length(intersect(rownames(pde_diet@meta.data)[pde_diet$souporcell_cluster %in% hgg_clusters_pde_v2],
+                          malignant_cells_all)))
+
+res_gb_v2_malignant <- run_infercnv_shared_reference_malignant(
+  seurat_obj = gb_diet, combined_obj = combined_for_ref, pool_label = "GB_malignant",
+  fixed_ref_cells = shared_myeloid_reference_clean, gene_order_file = gene_order_file,
+  restrict_to = malignant_cells_all, clusters_subset = hgg_clusters_gb_patient1,  # = c("1")
+  n_threads = 1
+)
+res_pde_v2_malignant <- run_infercnv_shared_reference_malignant(
+  seurat_obj = pde_diet, combined_obj = combined_for_ref, pool_label = "PDE_malignant",
+  fixed_ref_cells = shared_myeloid_reference_clean, gene_order_file = gene_order_file,
+  restrict_to = malignant_cells_all, clusters_subset = hgg_clusters_pde_v2,  # = c("0","2","3")
+  n_threads = 1
+)
+
+profiles_gb_v2_malignant  <- collect_chr_profiles(res_gb_v2_malignant)
+profiles_pde_v2_malignant <- collect_chr_profiles(res_pde_v2_malignant)
+
+gb_condition_profile_malignant  <- pool_condition_profile(profiles_gb_v2_malignant,  hgg_clusters_gb_patient1)
+pde_condition_profile_malignant <- pool_condition_profile(profiles_pde_v2_malignant, hgg_clusters_pde_v2)
+```
+
+### 14.2 Genome-wide CNV profile (malignant-only, patient-matched)
+
+```{r fig411-panel-A, fig.width=13, fig.height=5}
+# FIGURE: BODY -- Figure 4.11, panel A
+
+common_genes_malignant <- intersect(names(gb_condition_profile_malignant), names(pde_condition_profile_malignant))
+r_malignant <- cor(gb_condition_profile_malignant[common_genes_malignant],
+                    pde_condition_profile_malignant[common_genes_malignant],
+                    method = "pearson")
+
+chr_profile_combined_malignant <- bind_rows(
+  chr_profile_by_condition(gb_condition_profile_malignant,  gene_order) %>% mutate(pool = "GB"),
+  chr_profile_by_condition(pde_condition_profile_malignant, gene_order) %>% mutate(pool = "PDE")
+)
+chr_profile_combined_malignant$chr <- factor(chr_profile_combined_malignant$chr, levels = paste0("chr", 1:22))
+chr_profile_combined_malignant <- chr_profile_combined_malignant[!is.na(chr_profile_combined_malignant$chr), ]
+
+p_chr_profile_malignant <- ggplot(chr_profile_combined_malignant, aes(x = chr, y = mean_signal, color = pool, group = pool)) +
+  geom_line(linewidth = 0.8) + geom_point(size = 2) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "grey40") +
+  scale_color_manual(values = c("GB" = "#2C7FB8", "PDE" = "#D95F02")) +
+  labs(title = "Genome-wide CNV profile: GB tissue vs PDE (malignant-only)",
+       subtitle = paste0("Genome-wide Pearson r = ", round(r_malignant, 3)),
+       x = "Chromosome", y = "Mean CNV signal (inferCNV)", color = NULL) +
+  theme_thesis() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+p_chr_profile_malignant
+save_thesis(p_chr_profile_malignant, "figure_cnv_genome_profile_GB_vs_PDE_malignant_only.png", FIG_WIDE)
+```
+
+### 14.3 Pseudobulk gene expression (malignant-only)
+
+```{r fig411-panel-B, fig.width=6.5, fig.height=6.5}
+# FIGURE: BODY -- Figure 4.11, panel B (malignant cells, single matched patient -- no cluster structure, avoids circularity from the
+# jointly-integrated clusters). patient_id == "patient_1" matches panel A;
+# PDE clusters are already 100% patient_1, so this only removes patient_2_tissue_only cells on the tissue side. Verified to reproduce
+# r = 0.895, the value already used in the thesis text.
+library(ggrepel)
+
+malignant_cells <- subset(gb_pde_hgg, subset = !(hgg_clusters %in% c("3", "8", "9")) & patient_id == "patient_1")
+malignant_cells$condition_gp <- ifelse(malignant_cells$orig.ident == "GB_tissue", "GB", "PDE")
+
+avg_expr <- as.matrix(AverageExpression(malignant_cells, group.by = "condition_gp", assays = "SCT")$SCT)
+gene_cor <- cor(avg_expr[, "GB"], avg_expr[, "PDE"], method = "pearson")
+
+gene_df <- data.frame(gene = rownames(avg_expr), GB = avg_expr[, "GB"], PDE = avg_expr[, "PDE"])
+gene_df$GB_log  <- log1p(gene_df$GB)
+gene_df$PDE_log <- log1p(gene_df$PDE)
+gene_cor_log <- cor(gene_df$GB_log, gene_df$PDE_log, method = "pearson")
+
+highlight_genes <- c("GFAP", "SOX2", "MKI67", "PECAM1", "PTPRC", "NES", "OLIG2", "EGFR")
+gene_df$highlight <- gene_df$gene %in% highlight_genes
+
+p_scatter <- ggplot(gene_df, aes(x = GB_log, y = PDE_log)) +
+  geom_point(aes(color = highlight), size = 0.6, alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey40") +
+  geom_text_repel(data = subset(gene_df, highlight), aes(label = gene), size = 3, max.overlaps = 20) +
+  scale_color_manual(values = c(`FALSE` = "grey70", `TRUE` = "#e34948"), guide = "none") +
+  labs(title = "Mean gene expression: GB tissue vs PDE",
+       subtitle = paste0("Genome-wide Pearson r (log scale) = ", round(gene_cor_log, 3)),
+       x = "log(mean expression + 1), GB tissue", y = "log(mean expression + 1), PDE") +
+  theme_thesis()
+p_scatter
+save_thesis(p_scatter, "gene_level_GB_vs_PDE_scatter_log.png", list(w = FIG_SINGLE$w + 1, h = FIG_SINGLE$h + 2))
+```
+
+## 15. Per-chromosome, per-cell CNV distribution (Annexe -- amplitude-gap explanation)
+
+Follows up on Figure 4.11 panel A: although the genome-wide CNV profile
+correlates well between GB tissue and PDE (same altered chromosomes), their
+signal AMPLITUDE differs on several of them. This section looks at the
+per-cell, per-chromosome score distributions (not averaged across
+chromosomes, unlike panel A) to see whether that gap is specific to the
+chromosomes already known to be altered, or generic across the genome --
+this is the figure referenced in Results as the Annexe support for the
+culture-enrichment hypothesis.
+
+```{r fig-annexe-percell-bychr}
+library(tidyr)
+
+## Score par cellule ET par chromosome (pas de moyenne genome-wide,
+## pas restreint a chr7/10) -- une colonne par chromosome, une ligne par cellule.
+read_infercnv_percell_bychr <- function(out_dir, gene_order) {
+  obj_file <- file.path(out_dir, "run.final.infercnv_obj")
+  if (!file.exists(obj_file)) { warning(sprintf("Can't find %s", obj_file)); return(NULL) }
+  infercnv_obj <- readRDS(obj_file)
+
+  full_mat <- infercnv_obj@expr.data
+  obs_idx  <- unlist(infercnv_obj@observation_grouped_cell_indices)
+  obs      <- full_mat[, obs_idx, drop = FALSE]
+
+  common_genes <- intersect(rownames(obs), rownames(gene_order))
+  obs   <- obs[common_genes, , drop = FALSE]
+  chrom <- gene_order[common_genes, "chr"]
+
+  chr_num_vals <- as.numeric(gsub("[^0-9]", "", as.character(chrom)))
+  keep <- !is.na(chr_num_vals) & chr_num_vals %in% 1:22
+  obs <- obs[keep, , drop = FALSE]
+  chr_label <- paste0("chr", chr_num_vals[keep])
+  chr_levels <- paste0("chr", sort(unique(chr_num_vals[keep])))
+
+  mat <- sapply(chr_levels, function(ch) {
+    genes_this_chr <- rownames(obs)[chr_label == ch]
+    if (length(genes_this_chr) == 0) return(rep(NA_real_, ncol(obs)))
+    colMeans(obs[genes_this_chr, , drop = FALSE])
+  })
+  colnames(mat) <- chr_levels
+  rownames(mat) <- colnames(obs)
+  as.data.frame(mat)
+}
+
+extract_percell_bychr <- function(res, pool_label, gene_order) {
+  do.call(rbind, lapply(names(res), function(cl) {
+    if (!identical(res[[cl]]$status, "done")) return(NULL)
+    df <- read_infercnv_percell_bychr(res[[cl]]$out_dir, gene_order)
+    if (is.null(df)) return(NULL)
+    df$cell_id   <- rownames(df)
+    df$cluster   <- cl
+    df$condition <- pool_label
+    df
+  }))
+}
+
+bychr_gb       <- extract_percell_bychr(res_gb_v2_malignant,  "GB",  gene_order)
+bychr_pde      <- extract_percell_bychr(res_pde_v2_malignant, "PDE", gene_order)
+bychr_combined <- rbind(bychr_gb, bychr_pde)
+
+bychr_long <- bychr_combined %>%
+  pivot_longer(cols = starts_with("chr"), names_to = "chr", values_to = "score") %>%
+  mutate(chr = factor(chr, levels = paste0("chr", 1:22)))
+
+p_bychr_dist <- ggplot(bychr_long, aes(x = score, fill = condition, color = condition)) +
+  geom_density(alpha = 0.4, linewidth = 0.6) +
+  facet_wrap(~ chr, scales = "free", ncol = 4) +
+  scale_fill_manual(values = c("GB" = "#2C7FB8", "PDE" = "#D95F02")) +
+  scale_color_manual(values = c("GB" = "#2C7FB8", "PDE" = "#D95F02")) +
+  labs(title = "Per-cell CNV signal by chromosome (malignant-only)",
+       x = "Mean signal (per cell)", y = "Density", fill = NULL, color = NULL) +
+  theme_thesis(base_size = 10)
+
+p_bychr_dist
+save_thesis(p_bychr_dist, "figure_percell_bychr_distribution_malignant.png", list(w = 14, h = 16))
+```
